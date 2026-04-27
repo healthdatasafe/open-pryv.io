@@ -111,7 +111,7 @@ NODE_ENV=production node bin/master.js --config /path/to/your/override-config.ym
 ## Common pitfalls for agents
 
 - **Don't assume MongoDB.** The engine plugin tree lets operators choose; a contribution that hard-codes MongoDB or SQLite inside business logic will get rejected. Use `pluginLoader.getEngineModule(pluginLoader.getEngineFor('<storageType>'))`.
-- **Don't add an APM agent at `require()` time unconditionally.** Observability is opt-in per `macroPryv`-equivalent plan 38 (if your fork has it) or via the generic `PRYV_OBSERVABILITY_PROVIDER` env gate. Always honour `NODE_ENV=test` as a no-op.
+- **Don't add an APM agent at `require()` time unconditionally.** Observability should be opt-in via an env gate (e.g. `PRYV_OBSERVABILITY_PROVIDER`) and must always honour `NODE_ENV=test` as a no-op so tests stay hermetic.
 - **Don't edit `README-DBs.md` without cross-checking the plugin tree.** The file predates the current `storages/engines/*` plugin loader; its "rqlite is the only runtime-selectable engine for platform" phrasing is narrower than the plugin manifests actually allow (though in practice rqlite is the only sensible platform choice).
 - **Don't introduce a second TLS terminator.** See truth #2.
 - **Don't hot-wire cert rotation with `fs.watchFile` or cron.** Use the existing `AcmeOrchestrator` → `acme:rotate` IPC → worker `reloadTls()` path.
