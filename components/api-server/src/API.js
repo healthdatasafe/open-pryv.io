@@ -5,11 +5,9 @@
  * Refer to LICENSE file
  */
 
-const async = require('async');
 const APIError = require('errors').APIError;
 const errors = require('errors').factory;
 const Result = require('./Result');
-const _ = require('lodash');
 const { getConfigUnsafe } = require('@pryv/boiler');
 
 let audit, throwIfMethodIsNotDeclared, isAuditActive;
@@ -120,7 +118,7 @@ class API {
         // Syntax allows strings in the function list, which means that the
         // implementation from that method needs to be copied over.
         //
-        if (!_.isFunction(fn)) {
+        if (typeof fn !== 'function') {
           // If this is not a function, it MUST be a string.
 
           if (typeof fn !== 'string') { throw new Error('AF: backrefs must be in string form.'); }
@@ -222,7 +220,11 @@ class API {
     });
 
     let unanmedCount = 0;
-    async.forEachSeries(methodList, function (currentFn, next) {
+    let i = 0;
+    function runNextMethod (err) {
+      if (err != null) return finalize(err);
+      if (i >= methodList.length) return finalize(null);
+      const currentFn = methodList[i++];
       // -- Tracing by Function
       const fnName = 'fn:' + (currentFn.name || methodId + '.unamed' + unanmedCount++);
       tracing.startSpan(fnName, {}, apiSpanName);
@@ -230,16 +232,15 @@ class API {
         if (err != null) tracing.setError(fnName, err);
         tracing.finishSpan(fnName);
         if (err != null) result.closeTracing(); // close open span for result that was left open
-        next(err);
+        runNextMethod(err);
       };
-      // ---
-
       try {
         currentFn(context, params, result, nextCloseSpan);
       } catch (err) {
         nextCloseSpan(err);
       }
-    }, function (err) {
+    }
+    function finalize (err) {
       if (err != null) {
         tracing.setError(apiSpanName, err);
         tracing.finishSpan(apiSpanName);
@@ -252,7 +253,8 @@ class API {
       }
       tracing.finishSpan(apiSpanName);
       callback(null, result);
-    });
+    }
+    runNextMethod();
   }
 
   // ----------------------------------------------------------- call statistics

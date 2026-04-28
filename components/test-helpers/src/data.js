@@ -9,15 +9,27 @@
  * Regroups shared test data and related  helper functions.
  */
 
-const async = require('async');
 const childProcess = require('child_process');
+
+// Tiny callback-series helper, used in dumpCurrent / restoreFromDump where the
+// step list is a mix of callback-style functions (childProcess.exec.bind(...),
+// fs.rm.bind(...), exports.resetUsers, etc). Replaces a former `async.series`
+// dependency.
+function runSeries (fns, cb) {
+  let i = 0;
+  function next (err) {
+    if (err || i >= fns.length) return cb(err);
+    try { fns[i++](next); } catch (e) { cb(e); }
+  }
+  next();
+}
+
 const dependencies = require('./dependencies');
-const mkdirp = require('mkdirp');
 const settings = dependencies.settings;
 const storage = dependencies.storage;
 const fs = require('fs');
 const path = require('path');
-const _ = require('lodash');
+const { deepMerge } = require('utils');
 const accountStreams = require('business/src/system-streams');
 const { getUsersRepository, User } = require('business/src/users');
 const { userLocalDirectory } = require('storage');
@@ -40,7 +52,7 @@ exports.resetUsers = async () => {
   const usersRepository = await getUsersRepository();
   await usersRepository.deleteAll();
   for (const user of users) {
-    const userObj = new User(_.merge(customAccountProperties, user)); // might alter storage "dump data" script
+    const userObj = new User(deepMerge(customAccountProperties, user)); // might alter storage "dump data" script
     await usersRepository.insertOne(userObj, false, true);
   }
 };
@@ -96,13 +108,10 @@ exports.resetEvents = function resetEvents (done, user) {
   // deleteData(storage.user.events, user || defaultUser, events, done);
   user = user || defaultUser;
   const eventsToWrite = events.map((e) => structuredClone(e));
-  let mall;
-  async.series([
-    async function removeNonAccountEvents () {
-      mall = await getMall();
+  (async () => {
+    try {
+      const mall = await getMall();
       await mall.events.localRemoveAllNonAccountEventsForUser(user.id);
-    },
-    async function createEvents () {
       for (const event of eventsToWrite) {
         const eventSource = structuredClone(event);
         if (eventSource.attachments != null && eventSource.attachments.length > 0) {
@@ -120,14 +129,14 @@ exports.resetEvents = function resetEvents (done, user) {
           await mall.events.create(user.id, eventSource, null, true);
         }
       }
-    },
-    function removeZerosDuration (done2) {
       events.forEach((e) => {
         if (e.duration === 0) { delete e.duration; }
       });
-      done2();
+      done();
+    } catch (err) {
+      done(err);
     }
-  ], done);
+  })();
 };
 
 // streams
@@ -146,23 +155,26 @@ exports.resetStreams = function (done, user) {
       await addStreams(children);
     }
   }
-  async.series([
-    async () => {
+  (async () => {
+    try {
       mall = await getMall();
       await mall.streams.deleteAll(myUser.id, 'local');
       await addStreams(streams);
+      done();
+    } catch (err) {
+      done(err);
     }
-  ], done);
+  })();
 };
 
 /**
  * @returns {void}
  */
 function resetMongoDBCollectionFor (storage, user, items, done) {
-  async.series([
-    storage.removeAll.bind(storage, user),
-    storage.insertMany.bind(storage, user, items)
-  ], done);
+  storage.removeAll(user, function (err) {
+    if (err) return done(err);
+    storage.insertMany(user, items, done);
+  });
 }
 
 // attachments
@@ -225,7 +237,7 @@ exports.dumpCurrent = function (mongoFolder, version, callback) {
   const mongodump = path.resolve(mongoFolder, 'bin/mongodump');
   const outputFolder = getDumpFolder(version);
   logger.info('Dumping current test data to ' + outputFolder);
-  async.series([
+  runSeries([
     clearAllData,
     exports.resetUsers,
     exports.resetAccesses,
@@ -276,7 +288,7 @@ exports.restoreFromDump = function (versionNum, mongoFolder, callback) {
   if (!fs.existsSync(sourceDBFolder) || !fs.existsSync(sourceFilesArchive)) {
     throw new Error('Missing source dump or part of it at ' + sourceFolder);
   }
-  async.series([
+  runSeries([
     clearAllData,
     childProcess.exec.bind(null, mongorestore +
             ' --nsFrom "pryv-node.*" --nsTo "pryv-node-test.*" ' +
@@ -293,7 +305,7 @@ exports.restoreFromDump = function (versionNum, mongoFolder, callback) {
             ' ' +
             sourceDBFolder),
     function (done) {
-      mkdirp.sync(settings.storages.engines.filesystem.attachmentsDirPath);
+      fs.mkdirSync(settings.storages.engines.filesystem.attachmentsDirPath, { recursive: true });
       done();
     },
     childProcess.exec.bind(null, 'tar -xzf ' +

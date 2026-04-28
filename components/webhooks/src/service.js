@@ -4,8 +4,6 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const bluebird = require('bluebird');
-const _ = require('lodash');
 const { pubsub } = require('messages');
 const Webhook = require('business/src/webhooks/Webhook');
 const WebhooksRepository = require('business/src/webhooks/repository');
@@ -82,7 +80,7 @@ class WebhooksService {
    */
   async sendBootMessage () {
     for (const entry of this.webhooks) {
-      await bluebird.all(entry[1].map(async (webhook) => {
+      await Promise.all(entry[1].map(async (webhook) => {
         await webhook.send(BOOT_MESSAGE);
       }));
     }
@@ -109,7 +107,7 @@ class WebhooksService {
     const username = usernameWebhook.username;
     const usersRepository = await getUsersRepository();
     const userId = await usersRepository.getUserIdForUsername(username);
-    this.addWebhook(username, new Webhook(_.extend({}, usernameWebhook.webhook, {
+    this.addWebhook(username, new Webhook(Object.assign({}, usernameWebhook.webhook, {
       webhooksRepository: this.repository,
       user: { id: userId, username }
     })));

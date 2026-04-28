@@ -5,10 +5,16 @@
  * Refer to LICENSE file
  */
 
-const bluebird = require('bluebird');
+const { fromCallback } = require('utils');
 const assert = require('assert');
-const _ = require('lodash');
 const ds = require('@pryv/datastore');
+
+function pick (obj, keys) {
+  const out = {};
+  for (const k of keys) if (k in obj) out[k] = obj[k];
+  return out;
+}
+
 const _internals = require('../_internals');
 const treeUtils = require('../../../../shared/treeUtils');
 
@@ -67,7 +73,7 @@ module.exports = ds.createUserStreams({
     if (allStreamsForAccount != null) return allStreamsForAccount;
 
     // get from DB
-    allStreamsForAccount = await bluebird.fromCallback((cb) => this.userStreamsStorage.find({ id: userId }, {}, null, cb));
+    allStreamsForAccount = await fromCallback((cb) => this.userStreamsStorage.find({ id: userId }, {}, null, cb));
     _internals.cache.setStreams(userId, 'local', allStreamsForAccount);
     return allStreamsForAccount;
   },
@@ -82,7 +88,7 @@ module.exports = ds.createUserStreams({
     const dbOptions = { sort: { deleted: options?.sortAscending ? 1 : -1 } };
     if (options?.limit != null) dbOptions.limit = options.limit;
     if (options?.skip != null) dbOptions.skip = options.skip;
-    const deletedStreams = await bluebird.fromCallback((cb) => this.userStreamsStorage.findDeletions({ id: userId }, query.deletedSince, options, cb));
+    const deletedStreams = await fromCallback((cb) => this.userStreamsStorage.findDeletions({ id: userId }, query.deletedSince, options, cb));
     return deletedStreams;
   },
 
@@ -99,30 +105,30 @@ module.exports = ds.createUserStreams({
     const deletedStreams = await this.getDeletions(userId, { deletedSince: Number.MIN_SAFE_INTEGER });
     const deletedStream = deletedStreams.filter(s => s.id === streamData.id);
     if (deletedStream.length > 0) {
-      await bluebird.fromCallback((cb) => this.userStreamsStorage.removeOne({ id: userId }, { id: deletedStream[0].id }, cb));
+      await fromCallback((cb) => this.userStreamsStorage.removeOne({ id: userId }, { id: deletedStream[0].id }, cb));
     }
-    return await bluebird.fromCallback((cb) => this.userStreamsStorage.insertOne({ id: userId }, streamData, cb));
+    return await fromCallback((cb) => this.userStreamsStorage.insertOne({ id: userId }, streamData, cb));
   },
 
   async update (userId, streamData) {
-    return await bluebird.fromCallback((cb) => this.userStreamsStorage.updateOne({ id: userId }, { id: streamData.id }, streamData, cb));
+    return await fromCallback((cb) => this.userStreamsStorage.updateOne({ id: userId }, { id: streamData.id }, streamData, cb));
   },
 
   async delete (userId, streamId) {
-    return await bluebird.fromCallback((cb) => this.userStreamsStorage.delete({ id: userId }, { id: streamId }, cb));
+    return await fromCallback((cb) => this.userStreamsStorage.delete({ id: userId }, { id: streamId }, cb));
   },
 
   async deleteAll (userId) {
-    await bluebird.fromCallback((cb) => this.userStreamsStorage.removeAll({ id: userId }, cb));
+    await fromCallback((cb) => this.userStreamsStorage.removeAll({ id: userId }, cb));
     _internals.cache.unsetUserData(userId);
   },
 
   async _deleteUser (userId) {
-    return await bluebird.fromCallback((cb) => this.userStreamsStorage.removeMany(userId, {}, cb));
+    return await fromCallback((cb) => this.userStreamsStorage.removeMany(userId, {}, cb));
   },
 
   async _getStorageInfos (userId) {
-    const count = await bluebird.fromCallback((cb) => this.userStreamsStorage.countAll(userId, cb));
+    const count = await fromCallback((cb) => this.userStreamsStorage.countAll(userId, cb));
     return { count };
   }
 });
@@ -137,7 +143,7 @@ function cloneStream (stream, childrenDepth) {
     return structuredClone(stream);
   } else {
     const StreamPropsWithoutChildren = STREAM_PROPERTIES.filter((p) => p !== 'children');
-    const copy = _.pick(stream, StreamPropsWithoutChildren);
+    const copy = pick(stream, StreamPropsWithoutChildren);
     if (childrenDepth === 0) {
       copy.childrenHidden = true;
       copy.children = [];

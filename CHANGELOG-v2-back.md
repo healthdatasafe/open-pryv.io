@@ -1,5 +1,191 @@
 # Changelog - Internal (no API impact)
 
+## Deploy hardening — single-core LE first-boot, embedded DNS, Dockerfile
+
+A bundle of five fixes surfaced by a fresh single-core Dokku deploy with
+`letsEncrypt.enabled: true` + embedded DNS + ACME DNS-01 wildcard.
+
+- **NEW** `components/business/src/acme/selfSignedPlaceholder.js` — when
+  `letsEncrypt.enabled` is on and the configured `http.ssl.keyFile` doesn't
+  exist yet, master writes a 1-day self-signed RSA-2048 cert at the
+  configured paths *before forking workers*. Workers' `https.createServer`
+  ENOENT-races would otherwise restart-loop the cluster until ACME issued
+  the first cert. Real cert hot-swaps via `setSecureContext` when ACME
+  completes (existing `acme:rotate` IPC + `reloadTls()` path). CN + SAN
+  derived from `deriveHostnames()` — same hostname the eventual ACME cert
+  carries. Pure node-forge (already a transitive of acme-client; no new
+  dep).
+- **CHANGE** `storages/engines/rqlite/src/rqliteProcess.js` — `-disco-mode
+  dns` + `-bootstrap-expect 1` flags now gated on a new
+  `cluster.discoveryEnabled: true` opt instead of unconditionally on
+  `dnsDomain != null`. Single-core deploys with `dns.domain` set (so the
+  embedded DNS can serve `<coreId>.<domain>`) no longer have rqlited block
+  for 30 s waiting for `lsc.<domain>` peers via the embedded DNS that only
+  starts *after* rqlited is ready.
+- **CHANGE** `components/business/src/bootstrap/applyBundle.js` — bootstrap
+  bundle now writes `cluster.discoveryEnabled: true` into the joiner's
+  `override-config.yml` when the bundle ships a `cluster.domain` (DNS-based
+  multi-core). DNSless multi-core deliberately leaves the flag unset —
+  peers find each other via explicit `core.url` instead.
+- **CHANGE** `components/dns-server/src/DnsServer.js` — embedded DNS now
+  resolves `<coreId>.<domain>` from PlatformDB. Previously such queries
+  fell into the `#answerUsername` path → NXDOMAIN, leaving the hostname
+  advertised in `hostings.*.availableCore` (and used for inter-core HTTP
+  routing) unreachable unless the operator pre-populated
+  `dns.staticEntries`. New private branch consults
+  `platform.getCoreInfo(prefix)` between `staticEntries` and the username
+  fallback; record-emission tail extracted into `#emitCoreInfoRecords` and
+  shared with `#answerUsername`. Operator overrides via `dns.staticEntries`
+  still win.
+- **CHANGE** `components/platform/src/Platform.js` — `coreIdToUrl()` now
+  returns slash-terminated URLs in all branches (cache hit, derived,
+  dnsLess fallback). Centralized via a small `withTrailingSlash()` helper.
+  Three downstream consumers that did `coreUrl + '/something'` updated to
+  drop the leading slash and avoid double-slash:
+  `business/src/auth/registration.js` cross-core forward POST,
+  `api-server/src/routes/reg/legacy.js` `?username=` redirect,
+  `api-server/src/routes/reg/access.js` `pollBase` (defensive — operator
+  may supply `core:url` with or without slash). Two `register.js` sites
+  that bypass `coreIdToUrl()` (the `coreUrl || ApiEndpoint.build('', null)`
+  fallbacks for the unknown-email and single-core/unconfigured branches)
+  wrapped at the call site.
+- **CHANGE** `Dockerfile` — `EXPOSE` now declares `80 443 3000 3001 4000
+  53/udp` (was just `3000`). Dokku's `dokku ports:add` only publishes ports
+  the Dockerfile exposes, so native HTTPS + embedded DNS deployments needed
+  an explicit `docker-options:add` workaround. EXPOSE is informational
+  only — no port is actually bound until the operator publishes it.
+  `INSTALL.md` Dokku section gained a paragraph about
+  `dokku ports:add http:80:80 https:443:443`.
+- Local validation: PG `business` 354/0 (was 346, +8 new `[SSPL]` for the
+  self-signed placeholder); PG `dns-server` 29/0 (was 26, +3 new `[DN35]`
+  `[DN36]` `[DN37]` for the PlatformDB-resolved `<coreId>.<domain>` branch);
+  rqlite-engine `[RQARGS]` 18/0 (was 15, +3 covering single-core /
+  no-domain / discovery-without-domain); api-server PG full 967/0. Full
+  `just test all` (PG) and `just test-mongo all` matrix at plan close.
+
+## `z-schema` → `ajv` (with z-schema-shaped error wrapper)
+
+- **DEP** `z-schema` removed from `package.json` `dependencies`. Replaced with `ajv@^8` + `ajv-draft-04` (our schemas use the draft-04 `id:` keyword) + `ajv-formats`.
+- **NEW** `components/utils/src/jsonValidator.js` — backed by ajv-draft-04, exposes the slice of the legacy z-schema API that callers depend on (`validate(data, schema, callback?)` either sync-returning-bool or async-via-callback, `validateSchema(schema)`, `getLastError()` / `getLastErrors()` / `lastReport`). Errors are reshaped to z-schema's wire format: `{ code, params: [], message, path }` with z-schema-style codes (`PATTERN`, `OBJECT_MISSING_REQUIRED_PROPERTY`, `INVALID_TYPE`, `MIN_LENGTH`, `MAX_LENGTH`, etc.) so `commonFunctions._addCustomMessage` and the `messages: { CODE: { code, message } }` blocks in schema files keep working unchanged. `required`-error paths end with `/` (e.g. `#/`) to match z-schema's exact shape so paramId fallback in `_addCustomMessage` resolves correctly.
+- **CHANGE** wrapper uses **per-schema fresh ajv instances**. Pryv schemas build new schema objects per request (e.g. `access.permissions(action)` returns a fresh top-level object each call, with nested `id: 'streamPermission'`); a shared registry would error with "reference resolves to more than one schema" on the second compile.
+- **CHANGE** wrapper pre-processes each schema with `stripUnreferencedIds` — drops schema-level `id` strings whose values aren't `$ref`-targeted from anywhere in the schema. Distinguishes schema-level `id: 'foo'` (drop if unused) from data-property-named `id: { type: 'string' }` (always keep). Top-level id is preserved so self-references (e.g. `systemStreamsSchema → $ref: 'systemStreamsSchema'`) keep resolving.
+- **CHANGE** `components/api-server/src/schema/event.js` — `id`-pattern regex replaced `\\:` (escaped colon) with plain `:`. ajv compiles `pattern` strings with the `u` (unicode) flag, which rejects unnecessary escapes; the colon is not a regex metacharacter and works in both modes.
+- **CHANGE** `components/api-server/src/schema/methodError.js` — `subErrors.items.$ref: '#error'` (id-fragment) replaced with `$ref: '#'` (root self-reference). ajv-draft-04 doesn't auto-treat top-level `id: 'error'` as an in-document anchor; root self-ref is the portable form across both validators.
+- **CHANGE** Three production callers migrated from `require('z-schema')`: `components/api-server/src/schema/validation.js` (the API method validator entry point), `components/business/src/types.js` (TypeRepository for event-type validation; both the lazy `TypeValidator.validateWithSchema` and the eager `TypeRepository._validator`), `components/api-server/test/helpers/validation.js` (test-side response-shape assertions). Callers consume the wrapper via `const { jsonValidator } = require('utils'); const v = jsonValidator()`.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0 (PG-pool exhaustion flake during cross-engine matrix runs cleared after `pg_ctl restart` — environmental, not from this slice).
+
+## `mongodb` driver 4.17 → 7.2 bump
+
+- **DEP** `mongodb` bumped from `^4.11.0` to `^7.2.0`. Three majors of driver: v5 removed callback-style APIs entirely (Promise-only), v6 dropped legacy `findOneAndUpdate` `{ value: doc }` wrapper (returns the doc directly), v7 ships BSON v7 + new connection-string parser + `@mongodb-js/saslprep`.
+- **CHANGE** `storages/engines/mongodb/src/Database.js` — every collection method (`findOne`, `find().toArray()`, `insertOne/Many`, `updateOne/Many`, `findOneAndUpdate`, `deleteOne/Many`, `countDocuments`, `drop`, `listIndexes`, `dropDatabase`) wrapped via two new local helpers `p2c(promise, callback)` / `p2cWithDup(promise, callback)`. The Database class still exposes its callback-shaped public API to consumers (storages/business/api-server) — only the driver-facing internals changed. `findOneAndUpdate` now returns the doc directly: dropped the `r && r.value` indirection. The connection bootstrap no longer issues `db('admin').command({ setFeatureCompatibilityVersion: '6.0' })` — server FCV is an operator concern, not application init (and v7's `confirm: true` requirement breaks against older servers).
+- Connection options (`connectTimeoutMS`, `socketTimeoutMS`, `writeConcern: { j, w }`, `appname`) all forward-compatible.
+- `mongodb-core` was a stale `devDependency` with zero consumers — left in the file for now (separate cleanup if anyone touches it).
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0 (one PG-pool exhaustion flake during the cross-engine run sequence, not a regression — cleared after a `pg_ctl restart -m fast`).
+
+## Drop `bluebird` from production runtime
+
+- **DROP** `bluebird` from root `package.json` `dependencies`. 26 production files migrated. Pass 1 (8 sites) replaced `bluebird.try` / `bluebird.all` / `bluebird.map` / `bluebird.mapSeries` with native equivalents (`Promise.all`, `Promise.all(arr.map(fn))`, for-of + await). Pass 2 (74 sites) replaced `bluebird.fromCallback((cb) => fn(args, cb))` with a tiny in-tree helper `fromCallback` exposed from `components/utils/`.
+- **NEW** `components/utils/src/fromCallback.js` — 9-line wrapper that turns a `(cb) => ...` thunk into a Promise resolving with the callback's value (or rejecting with the callback's err). Identical semantics to bluebird's `fromCallback`. Exported as `utils.fromCallback`.
+- **MOVE** `bluebird` from `dependencies` to `devDependencies` — three test files (`components/storage/test/hook.js`, `components/hfs-server/test/support/child_process.js`, `storages/engines/mongodb/test/hook.js`) still import it for legacy promise wiring; migrating them is a test-infra refactor for later (or folds into TS+ESM). `npm ls bluebird --omit=dev` shows no direct production dep; `bluebird@3.7.2` survives only via `email-templates → consolidate` (out of our control).
+- **CHANGE** `components/test-helpers/src/helpers-base.js` — dropped the no-op `bluebird: require('bluebird')` re-export. Zero consumers grep-confirmed.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0 (one transient `[WHBK] [BLNP]/[1VIT]` webhook-retry-state flake on a single matrix run, cleared on re-run — same family as the documented `[WH01]` flakes; not caused by this slice).
+
+## Drop `async` (callback control-flow lib) from production runtime
+
+- **CHANGE** 9 production files migrated from `async.series` / `forEachSeries` / `forEachOfSeries` / `until` to native `async`/`await` + for-of/while loops. Affected: `components/api-server/src/API.js` (forEachSeries → manual `runNextMethod` chain to preserve tracing+error semantics), `components/api-server/src/Result.js` (forEachOfSeries → `nextElement` chain), `components/api-server/src/methods/accesses.js` (forEachSeries + nested series → IIFE async/await), `components/api-server/src/methods/events.js` (series → linear async/await), `components/api-server/src/methods/profile.js` (series → callback chain), `components/hfs-server/src/metadata_cache.js` (series of mixed sync+promise → linear async/await; deleted unused `toCallback` helper), `components/test-helpers/src/{InstanceManager,DynamicInstanceManager}.js` (until → while loop), `components/test-helpers/src/data.js` (5 series sites → IIFE async/await; introduced tiny `runSeries` helper for `dumpCurrent`/`restoreFromDump` which mix callback-style step lists).
+- **MOVE** `async` from `dependencies` to `devDependencies`. Several `*-seq.test.js` files still use `async.series` / `async.eachSeries`; migrating those is a test-infra refactor we can do alongside the TS+ESM conversion.
+- `npm ls async --omit=dev` shows no direct dep; `async@3.2.6` remains as a transitive of `nconf` (boiler) and `winston` — out of scope here.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0.
+
+## `cuid` → `@paralleldrive/cuid2` for production ID minting
+
+- **DEP** Added `@paralleldrive/cuid2@^3.3.0` to `dependencies`. Moved `cuid@^2.1.8` from `dependencies` to `devDependencies` — test-helpers still uses `cuid.slug()` (cuid2 has no `.slug()` equivalent) so cuid is kept as a dev-only dep.
+- **CHANGE** 17 production files migrated from `require('cuid')` to `const { createId: cuid } = require('@paralleldrive/cuid2')` (or `createId: generateId` where the local alias was `generateId`). All call sites already use `cuid()` (default 24-char form) — cuid2's `createId()` is a clean drop-in.
+- **CHANGE** `components/api-server/src/schema/event.js` — id-format pattern broadened to accept three alternatives: system-stream id (`:scope:name`), legacy cuid v1/v2 (`^c[a-z0-9-]{24}$`), and cuid2 (`^[a-z][a-z0-9]{23}$`). The legacy pattern stays because existing IDs in databases are still cuid v1/v2 strings; the new pattern is required because cuid2 IDs don't share the `c…` prefix.
+- **NOTE — externally visible format change**: every newly minted event/stream/access/webhook/session/password-reset ID will be **24 lowercase alphanumeric chars without a `c` prefix** (cuid2 format), versus the prior `c[a-z0-9-]{24}` (25 chars total) cuid v1/v2 format. Existing IDs in production databases remain valid (string columns; no migration). Clients that regex-validate IDs against the legacy `^c[…]` pattern will need updating; the relaxed schema regex above accepts both.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0.
+
+## `lru-cache` 7.14 → 11.0; `cron` 2.4 → 4.4
+
+- **DEP** `lru-cache` bumped from `^7.14.1` to `^11.0.0`. The default export is now `{ LRUCache }` (renamed in v8). Six call sites updated with the alias trick `const { LRUCache: LRU } = require('lru-cache')` so the existing `new LRU({ … })` constructions stay verbatim. Affected: `components/cache/src/index.js`, `components/hfs-server/src/metadata_cache.js`, `components/hfs-server/src/web/op/store_series_batch.js`, `storages/engines/postgresql/src/AuditStoragePG.js`, `storages/engines/sqlite/src/userAccountStorage.js`, `storages/engines/sqlite/src/userSQLite/Storage.js`. Constructor options (`max`, `ttl`, `dispose(value, key)`) are forward-compatible.
+- **DEP** `cron` bumped from `^2.4.4` to `^4.4.0`. v4 changed the constructor: `new CronJob({ cronTime, onTick })` no longer works (the constructor is positional in v4); use `CronJob.from({ cronTime, onTick })` instead. Single call site updated in `components/previews-server/src/routes/event-previews.js`. Cron pattern format unchanged (6-field with seconds slot still supported).
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0.
+
+## Tracing as a no-op shim; drop jaeger-client + cls-hooked + opentracing
+
+- **CHANGE** `components/tracing/src/Tracing.js` — collapsed to a single `DummyTracing` no-op class. The exported `Tracing` and `DummyTracing` symbols both now point at the same no-op. The architectural slot is preserved so a future tracer (e.g. an OpenTelemetry adapter) can plug in here without touching consumers.
+- **CHANGE** `components/tracing/src/index.js` — dropped the `isTracingEnabled` / `launchTags` config branches; `initRootSpan` always returns a `DummyTracing` instance. `tracingMiddleware` simplified to `(req, res, next) => { req.tracing ??= new DummyTracing(); next(); }`.
+- **CHANGE** `components/tracing/src/databaseTracer.js` — replaced the Jaeger-driven monkey-patcher with `module.exports = function patch () {};`. Callers in `components/storage/src/index.js` and `storages/index.js` need no edits.
+- **CHANGE** `components/tracing/src/HookedTracer.js` — replaced with a no-op `HookedTracer` class.
+- **CHANGE** `components/hfs-server/src/tracing/cls.js` — replaced with a no-op `Cls` class. `setRootSpan`/`getRootSpan`/`startExpressContext` all return null or pass through.
+- **CHANGE** `components/hfs-server/src/tracing/middleware/trace.js` — passthrough that calls `next()`.
+- **CHANGE** `components/hfs-server/src/application.js` — dropped `opentracing` and `jaeger-client` imports; `produceTracer` removed; replaced with an inline `NoopTracer` / `NoopSpan` minimal stub used by `Context#childSpan`.
+- **CHANGE** `components/hfs-server/src/server.js` — removed the `if (traceEnabled)` block that registered the trace+cls middleware. The `traceEnabled` config flag and the `clsWrapFactory` / `tracingMiddlewareFactory` imports are gone.
+- **CHANGE** `components/hfs-server/src/web/controller.js` — `storeErrorInTrace` no longer reads `opentracing.Tags.ERROR`; it tags the root span (now always null) with the literal string `'error'`. With cls returning null, the function early-returns; behaviour is unchanged from the prior `trace.enable: false` default.
+- **DROP** from `package.json` `dependencies`:
+  - `jaeger-client`
+  - `cls-hooked`
+  - `opentracing`
+  - `shimmer`
+- `npm ls jaeger-client opentracing cls-hooked shimmer --omit=dev` is empty.
+- **AGENTS.md** truth #6 rewritten to describe the slot-shim model and direct future tracer authors to `components/tracing/src/Tracing.js`.
+- New Relic APM (Plan 38) is the active observability path and runs in parallel, not through `components/tracing/`. Operators using New Relic see no change. Operators relying on `trace.enable: true` (none we're aware of) will find the flag is now ignored — Jaeger is gone.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0.
+
+## Dependency cleanup batch — Plan 52 Phase 4
+
+- **DROP** `hjson` from `package.json`. Zero call sites in the entire repo (production or test).
+- **DROP** `url` from `package.json`. The single `require('url')` site in `components/test-helpers/src/spawner.js` resolves to the Node 24 built-in `url` module (same name) — the npm package was a no-op shadow.
+- **DROP** `mkdirp` from `package.json`. Replaced 8 call sites across 6 production files + 1 test-helper file with `fs.mkdir(path, { recursive: true })` / `fs.mkdirSync(path, { recursive: true })` (Node ≥ 10). Affected: `components/business/src/integrity/MulterIntegrityDiskStorage.js`, `components/previews-server/src/attachmentManagement.js`, `components/storage/src/userLocalDirectory.js`, `storages/engines/filesystem/src/EventLocalFiles.js`, `storages/engines/sqlite/src/usersLocalIndex.js`, `storages/engines/rqlite/src/rqliteProcess.js`, `components/test-helpers/src/data.js`.
+- **DROP** `body-parser` from `package.json`. Replaced 3 production sites + 3 test sites with the express-built-in equivalents (`express.json()` / `express.urlencoded()`) — Express 4.16+ ships them. Affected: `components/api-server/src/expressApp.js`, `components/hfs-server/src/server.js`, `components/previews-server/src/expressApp.js`, plus three local-`HttpServer` test mocks.
+- **MOVE** `awaiting`, `fs-extra`, `backloop.dev`, `msgpack5` from `dependencies` to `devDependencies`:
+  - `awaiting` is required by 3 acceptance test files and zero production files.
+  - `fs-extra` is required by 1 storage test file and zero production files.
+  - `backloop.dev` is loaded only behind the `http:ssl:backloop.dev` config flag in `components/api-server/src/server.js`, a local-dev convenience; production runs use ACME (Plan 35) or operator certs.
+  - `msgpack5` is required by `components/test-helpers/src/{child_process,spawner}.js` only.
+- **AGENTS.md**: added architectural truth #6 documenting that `components/tracing/` remains a real production dependency (8 hot-path call sites) even when Jaeger is disabled, and that `trace.enable: false` only short-circuits the `Tracing` body — wiring is hot-path. Future deletion of `components/tracing/` requires touching all 8 callers in the same patch (filed as `XXX-Backlog/PLAN52-PHASE4-TRACING-RIPOUT.md`).
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → matches Plan 52 Phase 3.S.2 baseline.
+- Out of scope (filed for follow-up): drop `async` callback-control-flow lib (`XXX-Backlog/PLAN52-PHASE4-ASYNC-CALLBACK-DROP.md`), drop `bluebird` (recommended to fold into TS+ESM migration), replace `unix-timestamp`'s duration DSL, major bumps for `lru-cache` / `cron` / `slug` / `email-templates` / `nodemailer` (`_plans/XX-deps-major-bumps-later/PLAN.md`), `mongodb` 4→7 (own plan TBD), `z-schema` → `ajv` (own plan TBD), `cuid` → `cuid2` (own plan TBD).
+
+## `superagent` → native `fetch` complete; `superagent` moved to `devDependencies`
+
+- **CHANGE** `components/api-server/src/methods/helpers/mailing.js` — `_sendmail()` uses native `fetch`. Callback contract preserved (`cb(err, res)`); `parseError()` now also matches `ENOTFOUND`/`ECONNREFUSED` in the unreachable-endpoint branch since native fetch's reject messages differ from superagent's.
+- **CHANGE** `components/business/src/mfa/Service.js` — `_makeRequest()` uses native `fetch`, JSON-encoding non-string POST bodies and explicitly throwing on `!res.ok` so the existing `try/catch → invalidOperation('mfa-sms-provider-error')` translation still fires. Consumers (`SingleService`, `ChallengeVerifyService`) `await` without reading the response body, so the swap is transparent at call sites.
+- **DEP** `nock` bumped from `^13.2.9` to `^14.0.13` (latest stable). v14's headline feature is native `fetch` interception via `@mswjs/interceptors`, which is what unblocked the two swaps above. Engine constraint `>=18.20.0 <20 || >=20.12.1` is satisfied by Node 24. No test API surface change required — `nock(host).post(...).reply(...)` chain works identically.
+- **FIX** `components/api-server/test/mfa-seq.test.js` — `nock.enableNetConnect('127.0.0.1')` widened to `enableNetConnect(/127\.0\.0\.1|localhost/)`. nock v14 intercepts native `fetch` too, and the rqlite client (`DBrqlite.query`/`execute`) connects to `localhost:4001` — `'127.0.0.1'` and `'localhost'` are not aliased by the allowlist.
+- **DEP** `superagent` moved from `dependencies` to `devDependencies` (still needed by `components/test-helpers/src/{request,parallelTestHelper}.js`). Production runtime no longer pulls `superagent` — and therefore no longer pulls its transitive `formidable@2.1.5`. `npm ls formidable --omit=dev` is now empty; `formidable` survives only via the test surface.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1734 / 0 (one pre-existing flake `[AUTH] [AU01] [FMJH]` on concurrent login race, not caused by this slice — re-runs cleanly).
+- Closes Plan 52 Phase 3.S.2 (combined with the previous Phase 3.S.1 commit, all four production `superagent` call sites are now on native `fetch`). Phase 3.F (formidable cleanup) auto-closed: production dep graph is `formidable`-free.
+
+## `superagent` → native `fetch` for `business/types.js` and `business/webhooks/Webhook.js`
+
+- **CHANGE** `components/business/src/types.js` — `TypeRepository.tryUpdate()` now fetches the remote event-types definition via Node's native `fetch` instead of `superagent`. Throws an explicit `Error("Event types fetch failed: HTTP <status> <statusText>")` on non-2xx so the existing `try/catch → unavailableError(err)` path still triggers. No behavior change at the call sites.
+- **CHANGE** `components/business/src/webhooks/Webhook.js` — `makeCall()` uses native `fetch`. To preserve the prior superagent semantics consumed by `runOnce()` and the `webhooks.test` API method, `makeCall()` now explicitly throws on `!res.ok` with `err.response = { status }` attached; native `fetch` does not throw on 4xx/5xx by default. Removed the unused `request = require('superagent')` import.
+- **NOT IN THIS SLICE**: `components/api-server/src/methods/helpers/mailing.js` and `components/business/src/mfa/Service.js` still use `superagent`. Both call sites are exercised by tests that intercept HTTP via `nock@^13.5.6`, which does not intercept Node 24's native `fetch` (Undici dispatcher). Migrating these two requires either upgrading to `nock@^14` (native fetch interceptor) or switching the affected tests to a real local HTTP server. Tracked in the next Phase 3.S.2 slice; out of scope here.
+- `superagent` therefore stays in runtime `dependencies` for now. The two completed swaps still reduce the production runtime's reliance on it.
+- Local validation: PG `just test all` → 1742 / 0; Mongo `just test-mongo all` → 1735 / 0 (both match Phase 3.L baseline).
+
+## `@pryv/boiler` vendored as an in-tree workspace package
+
+- **NEW** `components/boiler/` workspace package — exact copy of the `@pryv/boiler@1.2.4` source tree (8 files, 4 src/ files + lib/nconf-yaml + README + LICENSE + package.json). Resolves under the existing npm-workspace symlink at `node_modules/@pryv/boiler` so every `require('@pryv/boiler')` call site continues to work unchanged.
+- `package.json` — `@pryv/boiler` removed from runtime `dependencies`; the workspace package now satisfies the import. No longer pulls boiler from the upstream `pryv/pryv-boiler.git#semver:^1.2.4` git URL at install time.
+- `package-lock.json` — boiler's transitive deps (`debug`, `js-yaml`, `nconf`, `superagent`, `winston`, `winston-daily-rotate-file`) now resolve against the in-tree workspace; root-level entries unchanged in production behaviour.
+- Local validation: `just test all` (PG default) → 1742 / 0 (matches pre-vendoring baseline).
+- Why: this is the first slice of a phased removal. With boiler in-tree we can drop the remote-config `superagent` path, the unused `notifyAirbrake`/airbrake stubs, and the `pluginAsync` ordering surface in follow-up commits without coupling those changes to a `package.json` dep change. Each simplification step is a standalone commit with its own test pass.
+
+## CI back to fully green; PostgreSQL-only test job
+
+- **FIX** `storages/engines/rqlite/scripts/setup` — replaced `$0` with `${BASH_SOURCE[0]}` for `SCRIPT_FOLDER` resolution. The script is sourced (not exec'd) from `scripts/setup-dev-env`, which made `$0` resolve to the parent script's directory. As a result `REPO_ROOT=$SCRIPT_FOLDER/../../../..` landed one parent above the actual repo root, and `bin-ext/rqlited` was installed outside the repo. The start script (which uses its own correct path resolution) then could not find the binary, rqlited never came up, and every test that touches PlatformDB failed with `TypeError: fetch failed → ECONNREFUSED` against `localhost:4001`. Masked since 2026-04-14 by `continue-on-error: true` on the test jobs.
+- **FIX** `storages/engines/mongodb/scripts/setup` — same one-line fix for consistency. The latent bug did not manifest for mongo because mongo's setup uses `$VAR_PRYV_FOLDER` (exported correctly by the parent) for path computation rather than `SCRIPT_FOLDER`.
+- **FIX** `storages/engines/postgresql/src/userAccountStorage.js` — `getPasswordHash()` now returns `undefined` (not `null`) when no password row exists, matching the conformance contract and the MongoDB engine. `getCurrentPasswordTime()` now throws `Error("No password found in database for user id ...")` when no row exists, matching the MongoDB engine's behaviour. Closes the three pre-existing PG-side `[UAST]` conformance failures (`[V54S]` + the `clearHistory()` and `_clearAll()` round-trip checks).
+- `.github/workflows/ci.yml` — `test-mongo` job removed. PostgreSQL is the default baseStorage engine since 2026-04-24; MongoDB is opt-in (`just test-mongo all`) and validated locally rather than in CI. `continue-on-error: true` stopgap removed from `test-postgres`; the job is fully blocking again. `docker` job depends only on `test-postgres` + `lint`.
+
+## AGENTS.md — orientation doc for LLM coding agents
+
+- **NEW** `AGENTS.md` at repo root — fast-orientation guide for LLM coding agents (Claude Code, Cursor, Copilot, etc.) bootstrapping against open-pryv.io v2. Covers the "single-binary codebase" framing, annotated repo map, local-run + test commands, five architectural truths (master.js lifecycle, native TLS, wildcard certs via `deriveHostnames`, pluggable storage engines, cluster CA lifecycle), common pitfalls, config precedence, and a curated block of in-repo + pryv.github.io links.
+- `README.md` — "For LLM coding agents" paragraph at the bottom points at `AGENTS.md`.
+- The draft that preceded this entry had drifted against the tree (non-existent `just dev` / `just test-postgres` recipes, wrong engine-config YAML keys, stale meta-repo framing, outdated `README-DBs.md` warning). All such issues fixed; file length 218 lines, under the 250-line soft cap.
+
 ## In-process mail component (services.email.method = 'in-process')
 
 - **NEW** `components/mail/` workspace package — ports `Sender` / `Template` / `errors` from the standalone service-mail repo; adds `TemplateRepository` against an injected `templateExists` (so the backing store can be tmp-dir, disk or PlatformDB) and a tmp-dir-materialize `emailTemplatesDelivery` adapter around the `email-templates` npm module. Façade `init()` / `isActive()` / `send()` / `refresh()` / `close()` with silent no-op before init so callers don't need to guard.

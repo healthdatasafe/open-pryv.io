@@ -5,7 +5,7 @@
  * Refer to LICENSE file
  */
 
-const _ = require('lodash');
+const { deepMerge } = require('utils');
 const assert = require('assert');
 const storeDataUtils = require('./helpers/storeDataUtils');
 const eventsUtils = require('./helpers/eventsUtils');
@@ -16,7 +16,7 @@ const integrity = require('business/src/integrity');
 
 const { Readable } = require('stream');
 
-const cuid = require('cuid');
+const { createId: cuid } = require('@paralleldrive/cuid2');
 
 /**
  * Storage for events.
@@ -395,12 +395,12 @@ class MallUserEvents {
     const mallEvents = this;
     async function * reader () {
       for await (const eventData of streamedMatchingEvents) {
-        const newEventData = _.merge(eventData, update.fieldsToSet);
+        const newEventData = deepMerge(eventData, update.fieldsToSet);
         if (update.addStreams && update.addStreams.length > 0) {
-          newEventData.streamIds = _.union(newEventData.streamIds, update.addStreams);
+          newEventData.streamIds = [...new Set([...newEventData.streamIds, ...update.addStreams])];
         }
         if (update.removeStreams && update.removeStreams.length > 0) {
-          newEventData.streamIds = _.difference(newEventData.streamIds, update.removeStreams);
+          newEventData.streamIds = newEventData.streamIds.filter(id => !update.removeStreams.includes(id));
         }
         // eventually remove fields from event
         if (update.fieldsToDelete && update.fieldsToDelete.length > 0) {

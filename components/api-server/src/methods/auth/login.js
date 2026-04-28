@@ -4,12 +4,11 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const bluebird = require('bluebird');
+const { fromCallback } = require('utils');
 const commonFns = require('api-server/src/methods/helpers/commonFunctions');
 const { ApiEndpoint } = require('utils');
 const errors = require('errors').factory;
 const methodsSchema = require('api-server/src/schema/authMethods');
-const _ = require('lodash');
 const { getUsersRepository, UserRepositoryOptions, getPasswordRules } = require('business/src/users');
 const { getStorageLayer } = require('storage');
 const { getConfig } = require('@pryv/boiler');
@@ -135,7 +134,7 @@ module.exports = async function (api) {
     }
 
     function createAccess (access, context, callback) {
-      _.extend(access, context.accessQuery);
+      Object.assign(access, context.accessQuery);
       context.initTrackingProperties(access, UserRepositoryOptions.SYSTEM_USER_ACCESS_ID);
       userAccessesStorage.insertOne(context.user, access, callback);
     }
@@ -185,7 +184,7 @@ module.exports = async function (api) {
     const mfaService = getMFAService(mfaCfg);
     if (mfaService == null) return next(); // MFA disabled server-wide
     try {
-      const profileSet = await bluebird.fromCallback(cb =>
+      const profileSet = await fromCallback(cb =>
         userProfileStorage.findOne(context.user, { id: MFA_PROFILE_ID }, null, cb));
       const storedMfa = profileSet && profileSet.data && profileSet.data.mfa;
       if (!storedMfa || !storedMfa.content || Object.keys(storedMfa.content).length === 0) {

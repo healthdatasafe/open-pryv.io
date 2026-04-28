@@ -4,11 +4,10 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const async = require('async');
+const { isDeepStrictEqual } = require('node:util');
 const slugify = require('utils').slugify;
-const _ = require('lodash');
 const timestamp = require('unix-timestamp');
-const bluebird = require('bluebird');
+const { fromCallback } = require('utils');
 
 const APIError = require('errors').APIError;
 const errors = require('errors').factory;
@@ -77,7 +76,7 @@ module.exports = async function produceAccessesApiMethods (api) {
       query.createdBy = currentAccess.id;
     }
     try {
-      let accesses = await bluebird.fromCallback((cb) => accessesRepository.find(context.user, query, dbFindOptions, cb));
+      let accesses = await fromCallback((cb) => accessesRepository.find(context.user, query, dbFindOptions, cb));
       if (excludeExpired(params)) {
         accesses = accesses.filter((a) => !isAccessExpired(a));
       }
@@ -107,7 +106,7 @@ module.exports = async function produceAccessesApiMethods (api) {
       query.createdBy = currentAccess.id;
     }
     try {
-      const deletions = await bluebird.fromCallback((cb) => accessesRepository.findDeletions(context.user, query, { projection: { calls: 0 } }, cb));
+      const deletions = await fromCallback((cb) => accessesRepository.findDeletions(context.user, query, { projection: { calls: 0 } }, cb));
       result.accessDeletions = deletions;
       next();
     } catch (err) {
@@ -342,7 +341,7 @@ module.exports = async function produceAccessesApiMethods (api) {
     if (currentAccess == null) { return next(new Error('AF: currentAccess cannot be null.')); }
     let access;
     try {
-      access = await bluebird.fromCallback((cb) => {
+      access = await fromCallback((cb) => {
         accessesRepository.findOne(context.user, { id: params.id }, dbFindOptions, cb);
       });
     } catch (err) {
@@ -367,7 +366,7 @@ module.exports = async function produceAccessesApiMethods (api) {
     }
     let accesses;
     try {
-      accesses = await bluebird.fromCallback((cb) => {
+      accesses = await fromCallback((cb) => {
         accessesRepository.find(context.user, { createdBy: params.id }, dbFindOptions, cb);
       });
     } catch (err) {
@@ -397,7 +396,7 @@ module.exports = async function produceAccessesApiMethods (api) {
       }
     }
     try {
-      await bluebird.fromCallback((cb) => {
+      await fromCallback((cb) => {
         accessesRepository.delete(context.user, { $or: idsToDelete }, cb);
       });
     } catch (err) {
@@ -464,14 +463,12 @@ module.exports = async function produceAccessesApiMethods (api) {
       }
     }
     // Compare clientData (treat null and undefined as equivalent)
-    if (!_.isEqual(access.clientData ?? null, clientData ?? null)) {
+    if (!isDeepStrictEqual(access.clientData ?? null, clientData ?? null)) {
       return false;
     }
     return true;
     function findByStreamId (permissions, streamId) {
-      return _.find(permissions, function (perm) {
-        return perm.streamId === streamId;
-      });
+      return permissions.find(perm => perm.streamId === streamId);
     }
   }
 
@@ -483,16 +480,18 @@ module.exports = async function produceAccessesApiMethods (api) {
     // modify permissions in-place, assume no side fx
     const checkedPermissions = permissions;
     let checkError = null;
-    async.forEachSeries(checkedPermissions, checkPermission, function (err) {
+    let i = 0;
+    function nextPermission (err) {
       if (err != null) {
         return err instanceof APIError
           ? callback(err)
           : callback(errors.unexpectedError(err));
       }
-      callback(null, checkedPermissions, checkError);
-    });
+      if (i >= checkedPermissions.length) return callback(null, checkedPermissions, checkError);
+      checkPermission(checkedPermissions[i++], nextPermission);
+    }
+    nextPermission();
 
-    // NOT REACHED
     function checkPermission (permission, done) {
       if (permission.streamId === '*') {
         // cleanup ignored properties just in case
@@ -506,31 +505,35 @@ module.exports = async function produceAccessesApiMethods (api) {
                     'missing the required "defaultName".'));
       }
       let permissionStream;
-      async.series([
-        async function checkId () {
+      (async () => {
+        try {
+          // checkId
           const existingStream = await mall.streams.getOneWithNoChildren(context.user.id, permission.streamId);
           if (existingStream != null) {
             permission.name = existingStream.name;
             delete permission.defaultName;
           }
-        },
-        async function checkSimilar () {
-          if (permissionStream != null) { return; }
-          // new streams are created at "root" level so we check the children's name of root (id)
-          const [storeId] = storeDataUtils.parseStoreIdAndStoreItemId(permission.streamId);
-          const rootStreams = await mall.streams.get(context.user.id, {
-            storeId,
-            state: 'all',
-            includeTrashed: true
-          });
-          const rootStreamsNames = rootStreams.map((stream) => stream.name);
-          const defaultBaseName = permission.defaultName;
-          for (let suffixNum = 1; rootStreamsNames.indexOf(permission.defaultName) !== -1; suffixNum++) {
-            permission.defaultName = `${defaultBaseName} (${suffixNum})`;
-            checkError = produceCheckError();
+          // checkSimilar
+          if (permissionStream == null) {
+            // new streams are created at "root" level so we check the children's name of root (id)
+            const [storeId] = storeDataUtils.parseStoreIdAndStoreItemId(permission.streamId);
+            const rootStreams = await mall.streams.get(context.user.id, {
+              storeId,
+              state: 'all',
+              includeTrashed: true
+            });
+            const rootStreamsNames = rootStreams.map((stream) => stream.name);
+            const defaultBaseName = permission.defaultName;
+            for (let suffixNum = 1; rootStreamsNames.indexOf(permission.defaultName) !== -1; suffixNum++) {
+              permission.defaultName = `${defaultBaseName} (${suffixNum})`;
+              checkError = produceCheckError();
+            }
           }
+          done();
+        } catch (err) {
+          done(err);
         }
-      ], done);
+      })();
     }
 
     function produceCheckError () {

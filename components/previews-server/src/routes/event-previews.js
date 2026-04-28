@@ -13,7 +13,6 @@ const errors = require('errors').factory;
 const sharp = require('sharp');
 const timestamp = require('unix-timestamp');
 const xattr = require('fs-xattr');
-const _ = require('lodash');
 const getAuth = require('middleware/src/getAuth');
 const { getLogger } = require('@pryv/boiler');
 const { getMall } = require('mall');
@@ -121,9 +120,7 @@ module.exports = async function (expressApp, initContextMiddleware, loadAccessMi
   }
   function getSourceAttachment (event) {
     // for now: just return the first attachment
-    return _.find(event.attachments, function (/* attachment */) {
-      return true;
-    });
+    return event.attachments?.[0];
   }
   function adjustImageError (err) {
     // sharp throws on corrupt/missing files with specific messages
@@ -187,7 +184,7 @@ module.exports = async function (expressApp, initContextMiddleware, loadAccessMi
       res.status(200).json({ message: 'Clean-up successful.' });
     });
   }
-  const cronJob = new CronJob({
+  const cronJob = CronJob.from({
     cronTime: previewsCacheCleanUpCronTime,
     onTick: function () {
       if (workerRunning) {

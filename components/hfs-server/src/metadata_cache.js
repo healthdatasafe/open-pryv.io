@@ -4,10 +4,8 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const async = require('async');
-const _ = require('lodash');
-const bluebird = require('bluebird');
-const LRU = require('lru-cache');
+const { fromCallback } = require('utils');
+const { LRUCache: LRU } = require('lru-cache');
 const logger = require('@pryv/boiler').getLogger('metadata_cache');
 const storage = require('storage');
 const MethodContext = require('business').MethodContext;
@@ -157,27 +155,16 @@ class MetadataLoader {
     };
     const customAuthStep = null;
     const methodContext = new MethodContext(contextSource, userName, accessToken, customAuthStep);
-    return bluebird.fromCallback((returnValueCallback) => {
-      async.series([
-        (next) => toCallback(methodContext.init(), next),
-        (next) => toCallback(methodContext.retrieveExpandedAccess(storage), next),
-        function loadEvent (done) {
-          // result is used in success handler!
-          const user = methodContext.user;
-          mall.events.getOne(user.id, eventId).then((event) => {
-            done(null, event);
-          }, (err) => {
-            done(err);
-          });
-        }
-      ], (err, results) => {
-        if (err != null) { return returnValueCallback(mapErrors(err)); }
-        const access = methodContext.access;
+    return fromCallback(async (returnValueCallback) => {
+      try {
+        await methodContext.init();
+        await methodContext.retrieveExpandedAccess(storage);
         const user = methodContext.user;
-        const event = _.last(results);
+        const event = await mall.events.getOne(user.id, eventId);
+        const access = methodContext.access;
         // Because we called retrieveExpandedAccess above.
         if (access == null) { throw new Error('AF: access != null'); }
-        // Because we called retrieveUser above.
+        // Because user was retrieved above.
         if (user == null) { throw new Error('AF: user != null'); }
         if (event === null) { return returnValueCallback(errors.unknownResource('event', eventId)); }
         const serieMetadata = new SeriesMetadataImpl(access, user, event);
@@ -186,15 +173,14 @@ class MetadataLoader {
         }, (error) => {
           returnValueCallback(error, serieMetadata);
         });
-      });
+      } catch (err) {
+        returnValueCallback(mapErrors(err));
+      }
     });
     function mapErrors (err) {
       if (!(err instanceof Error)) { return new Error(err); }
       // else
       return err;
-    }
-    function toCallback (promise, next) {
-      return bluebird.resolve(promise).asCallback(next);
     }
   }
 }

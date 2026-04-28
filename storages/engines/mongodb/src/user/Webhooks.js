@@ -7,7 +7,6 @@
 const BaseStorage = require('./BaseStorage');
 const converters = require('./../converters');
 const util = require('util');
-const _ = require('lodash');
 const timestamp = require('unix-timestamp');
 
 module.exports = Webhooks;
@@ -20,7 +19,7 @@ module.exports = Webhooks;
 function Webhooks (database) {
   Webhooks.super_.call(this, database);
 
-  _.extend(this.converters, {
+  Object.assign(this.converters, {
     itemDefaults: [
       converters.createIdIfMissing
     ],
@@ -99,7 +98,8 @@ Webhooks.prototype.insertOne = function (userOrUserId, webhook, callback) {
       if (err) {
         return callback(err);
       }
-      callback(null, _.omit(webhookToCreate, 'deleted'));
+      const { deleted: _omit, ...rest } = webhookToCreate;
+      callback(null, rest);
     }
   );
 };
@@ -109,7 +109,7 @@ Webhooks.prototype.insertOne = function (userOrUserId, webhook, callback) {
  */
 Webhooks.prototype.insertMany = function (userOrUserId, webhooks, callback) {
   const webhooksToCreate = webhooks.map((w) => {
-    if (w.deleted === undefined) return _.assign({ deleted: null }, w);
+    if (w.deleted === undefined) return Object.assign({ deleted: null }, w);
     return w;
   });
   this.database.insertMany(

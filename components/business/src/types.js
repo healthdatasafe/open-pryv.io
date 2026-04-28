@@ -5,10 +5,7 @@
  * Refer to LICENSE file
  */
 const fs = require('fs');
-const lodash = require('lodash');
-const superagent = require('superagent');
-const bluebird = require('bluebird');
-const ZSchemaValidator = require('z-schema');
+const { deepMerge, fromCallback, jsonValidator } = require('utils');
 let defaultTypes = require('./types/event-types.default.json');
 const errors = require('./types/errors');
 const SeriesRowType = require('./types/series_row_type');
@@ -45,13 +42,12 @@ class TypeValidator {
    * @param {any} schema
    * @returns {Promise<any>}
    */
-  validateWithSchema (content, schema) {
-    return bluebird.try(() => {
-      const validator = new ZSchemaValidator();
-      return bluebird
-        .fromCallback((cb) => validator.validate(content, schema, cb))
-        .then(() => content);
+  async validateWithSchema (content, schema) {
+    const validator = jsonValidator();
+    await new Promise((resolve, reject) => {
+      validator.validate(content, schema, (err) => err ? reject(err) : resolve());
     });
+    return content;
   }
 }
 // A repository of types that Pryv knows about. Currently, this is seeded from
@@ -85,7 +81,7 @@ class TypeValidator {
 class TypeRepository {
   _validator;
   constructor () {
-    this._validator = new ZSchemaValidator();
+    this._validator = jsonValidator();
   }
 
   /**
@@ -104,8 +100,7 @@ class TypeRepository {
     const content = event.content != null ? event.content : null;
     const schema = defaultTypes.types[event.type];
     if (schema == null) { throw new Error(`Event type validation was used on the unknown type "${event.type}".`); }
-    return bluebird
-      .fromCallback((cb) => this._validator.validate(content, schema, cb))
+    return fromCallback((cb) => this._validator.validate(content, schema, cb))
       .then(() => content);
   }
 
@@ -207,20 +202,21 @@ class TypeRepository {
         eventTypesDefinition = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
       } else {
         const USER_AGENT_PREFIX = 'Pryv.io/';
-        const res = await superagent
-          .get(sourceURL)
-          .set('User-Agent', USER_AGENT_PREFIX + apiVersion);
-        eventTypesDefinition = res.body;
+        const res = await fetch(sourceURL, {
+          headers: { 'User-Agent': USER_AGENT_PREFIX + apiVersion }
+        });
+        if (!res.ok) {
+          throw new Error(`Event types fetch failed: HTTP ${res.status} ${res.statusText}`);
+        }
+        eventTypesDefinition = await res.json();
       }
     } catch (err) {
       unavailableError(err);
     }
     const validator = this._validator;
-    await bluebird.try(() => {
-      if (!validator.validateSchema(eventTypesDefinition)) { return invalidError(validator.lastReport); }
-      // Overwrite defaultTypes with the merged list of type schemata.
-      defaultTypes = lodash.merge(defaultTypes, eventTypesDefinition);
-    });
+    if (!validator.validateSchema(eventTypesDefinition)) { return invalidError(validator.lastReport); }
+    // Overwrite defaultTypes with the merged list of type schemata.
+    defaultTypes = deepMerge(defaultTypes, eventTypesDefinition);
   }
 }
 module.exports = {

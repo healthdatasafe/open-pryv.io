@@ -4,8 +4,7 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const bluebird = require('bluebird');
-const LRU = require('lru-cache');
+const { LRUCache: LRU } = require('lru-cache');
 const errors = require('errors').factory;
 const business = require('business');
 const BatchRequest = business.series.BatchRequest;
@@ -42,7 +41,7 @@ async function storeSeriesBatch (ctx, req, res) {
     results.push(batchStoreOperation.store(data, (eventId) => resolver.getMeasurementName(eventId)));
   }
   // Wait for all store operations to complete.
-  await bluebird.all(results);
+  await Promise.all(results);
   trace.finish('append');
   trace.start('metadataUpdate');
   const entries = [];

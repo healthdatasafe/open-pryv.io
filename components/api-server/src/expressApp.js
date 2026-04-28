@@ -5,8 +5,6 @@
  * Refer to LICENSE file
  */
 const express = require('express');
-const _ = require('lodash');
-const bodyParser = require('body-parser');
 const middleware = require('middleware');
 const Paths = require('./routes/Paths');
 const { getConfig } = require('@pryv/boiler');
@@ -29,10 +27,9 @@ async function expressAppInit (logging) {
   // NOTE Insert this bit in front of 'requestTraceMiddleware' to also see
   //  username in logged paths.
   //
-  const ignorePaths = _.chain(Paths)
-    .filter((e) => _.isString(e))
-    .filter((e) => e.indexOf(Paths.Params.Username) < 0)
-    .value();
+  const ignorePaths = Object.values(Paths)
+    .filter((e) => typeof e === 'string')
+    .filter((e) => e.indexOf(Paths.Params.Username) < 0);
   if (!config.get('dnsLess:isActive')) {
     const coreId = config.get('core:id');
     const ignoredSubdomains = coreId && coreId !== 'single' ? [coreId] : [];
@@ -71,12 +68,12 @@ async function expressAppInit (logging) {
     app.use(middleware.subdomainToPath(ignorePaths, ignoredSubdomains));
   }
   // Parse JSON bodies:
-  app.use(bodyParser.json({
+  app.use(express.json({
     limit: config.get('uploads:maxSizeMb') + 'mb'
   }));
   // This object will contain key-value pairs, where the value can be a string
   // or array (when extended is false), or any type (when extended is true).
-  app.use(bodyParser.urlencoded({
+  app.use(express.urlencoded({
     extended: false
   }));
   // Other middleware:

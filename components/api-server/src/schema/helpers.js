@@ -8,8 +8,6 @@
  * Helpers for defining schemas.
  */
 
-const _ = require('lodash');
-
 const USERNAME_MIN_LENGTH = 5;
 const USERNAME_MAX_LENGTH = 60;
 const USERNAME_REGEXP_STR = '^[a-z0-9]' +
@@ -37,7 +35,7 @@ exports.getTypeURI = function (name, action) {
  * @param {Object} options Extra properties to merge into the returned object definition
  */
 exports.object = function (propertiesDef, options) {
-  return _.extend(getBaseSchema('object', options), { properties: propertiesDef });
+  return Object.assign(getBaseSchema('object', options), { properties: propertiesDef });
 };
 
 /**
@@ -47,7 +45,7 @@ exports.object = function (propertiesDef, options) {
  * @param {Object} options Extra properties to merge into the returned array definition
  */
 exports.array = function (itemsDef, options) {
-  return _.extend(getBaseSchema('array', options), { items: itemsDef });
+  return Object.assign(getBaseSchema('array', options), { items: itemsDef });
 };
 
 /**
@@ -104,8 +102,8 @@ function getBaseSchema (type, options) {
       result.type.push('null');
     }
     // We omit 'nullable' since we handled this particular option just above
-    const opt = _.omit(options, 'nullable');
-    _.extend(result, opt);
+    const { nullable: _omit, ...opt } = options;
+    Object.assign(result, opt);
   }
   return result;
 }

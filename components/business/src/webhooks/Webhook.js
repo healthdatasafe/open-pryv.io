@@ -4,9 +4,14 @@
  * This file is part of Pryv.io and released under BSD-Clause-3 License
  * Refer to LICENSE file
  */
-const request = require('superagent');
-const _ = require('lodash');
-const cuid = require('cuid');
+const { deepMerge } = require('utils');
+
+function pick (obj, keys) {
+  const out = {};
+  for (const k of keys) if (k in obj) out[k] = obj[k];
+  return out;
+}
+const { createId: cuid } = require('@paralleldrive/cuid2');
 const timestamp = require('unix-timestamp');
 const { pubsub } = require('messages');
 
@@ -177,15 +182,24 @@ class Webhook {
    * @returns {Promise<any>}
    */
   async makeCall (messages) {
-    const res = await request.post(this.url).send({
-      messages,
-      meta: {
-        apiVersion: this.apiVersion,
-        serverTime: timestamp.now(),
-        serial: this.serial
-      }
+    const res = await fetch(this.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages,
+        meta: {
+          apiVersion: this.apiVersion,
+          serverTime: timestamp.now(),
+          serial: this.serial
+        }
+      })
     });
-    return res;
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.response = { status: res.status };
+      throw err;
+    }
+    return { status: res.status };
   }
 
   /**
@@ -228,7 +242,7 @@ class Webhook {
    */
   async update (fieldsToUpdate) {
     const fields = Object.keys(fieldsToUpdate);
-    _.merge(this, fieldsToUpdate);
+    deepMerge(this, fieldsToUpdate);
     await makeUpdate(fields, this);
   }
 
@@ -253,7 +267,7 @@ class Webhook {
    * @returns {{}}
    */
   forStorage () {
-    return _.pick(this, [
+    return pick(this, [
       'id',
       'accessId',
       'url',
@@ -276,7 +290,7 @@ class Webhook {
    * @returns {{}}
    */
   forApi () {
-    return _.pick(this, [
+    return pick(this, [
       'id',
       'accessId',
       'url',
@@ -341,7 +355,7 @@ async function makeUpdate (fields, webhook) {
   if (fields == null) {
     update = webhook.forStorage();
   } else {
-    update = _.pick(webhook.forStorage(), fields);
+    update = pick(webhook.forStorage(), fields);
   }
   await webhook.repository.updateOne(webhook.user, update, webhook.id);
 }

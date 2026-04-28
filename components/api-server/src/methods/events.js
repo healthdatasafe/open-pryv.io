@@ -7,13 +7,11 @@
 
 const utils = require('utils');
 const errors = require('errors').factory;
-const async = require('async');
 const fs = require('fs');
 const commonFns = require('./helpers/commonFunctions');
 const methodsSchema = require('../schema/eventsMethods');
 const eventSchema = require('../schema/event');
 const timestamp = require('unix-timestamp');
-const _ = require('lodash');
 
 const { getMall, storeDataUtils } = require('mall');
 const accountStreams = require('business/src/system-streams');
@@ -212,8 +210,8 @@ module.exports = async function (api) {
     const allAccountStreamIds = Object.keys(accountStreams.accountMap);
     const streamIds = context.newEvent.streamIds || [];
     const oldStreamIds = context.oldEvent ? context.oldEvent.streamIds : [];
-    context.accountStreamIds = _.intersection(allAccountStreamIds, streamIds);
-    context.oldAccountStreamIds = _.intersection(allAccountStreamIds, oldStreamIds);
+    context.accountStreamIds = allAccountStreamIds.filter(id => streamIds.includes(id));
+    context.oldAccountStreamIds = allAccountStreamIds.filter(id => oldStreamIds.includes(id));
     context.doesEventBelongToAccountStream =
       context.accountStreamIds.length > 0 || context.oldAccountStreamIds.length > 0;
     next();
@@ -469,7 +467,7 @@ module.exports = async function (api) {
     if (!canUpdateEvent) { return next(errors.forbidden()); }
     if (hasStreamIdsModification(eventUpdate)) {
       // 2. check that streams we add have contribute access
-      const streamIdsToAdd = _.difference(eventUpdate.streamIds, event.streamIds);
+      const streamIdsToAdd = eventUpdate.streamIds.filter(id => !event.streamIds.includes(id));
       for (const streamIdToAdd of streamIdsToAdd) {
         if (!(await context.access.canUpdateEventsOnStream(streamIdToAdd))) {
           return next(errors.forbidden());
@@ -477,7 +475,7 @@ module.exports = async function (api) {
       }
       // 3. check that streams we remove have contribute access
       // streamsToRemove = event.streamIds - eventUpdate.streamIds
-      const streamIdsToRemove = _.difference(event.streamIds, eventUpdate.streamIds);
+      const streamIdsToRemove = event.streamIds.filter(id => !eventUpdate.streamIds.includes(id));
       for (const streamIdToRemove of streamIdsToRemove) {
         if (!(await context.access.canUpdateEventsOnStream(streamIdToRemove))) {
           return next(errors.forbidden());
@@ -498,7 +496,7 @@ module.exports = async function (api) {
       }
     }
     context.oldEvent = structuredClone(event);
-    context.newEvent = _.extend(event, eventUpdate);
+    context.newEvent = Object.assign(event, eventUpdate);
     // clientData key-map handling
     if (eventUpdate.clientData != null) {
       context.newEvent.clientData = structuredClone(context.oldEvent.clientData || {});
@@ -554,9 +552,7 @@ module.exports = async function (api) {
     if (isSeriesEvent(context.event || result.event)) {
       const isDelete = !!result.eventDeletion;
       // if event is a deletion 'id' is given by result.eventDeletion
-      const updatedEventId = isDelete
-        ? _.pick(result.eventDeletion, ['id'])
-        : _.pick(result.event, ['id']);
+      const updatedEventId = { id: (isDelete ? result.eventDeletion : result.event).id };
       const subject = isDelete
         ? pubsub.SERIES_DELETE_EVENTID_USERNAME
         : pubsub.SERIES_UPDATE_EVENTID_USERNAME;
@@ -706,30 +702,26 @@ module.exports = async function (api) {
     result.event.attachments = setFileReadToken(context.access, result.event.attachments);
     next();
   }
-  function deleteWithData (context, params, result, next) {
-    async.series([
-      async function deleteEvent () {
-        await mall.events.delete(context.user.id, context.oldEvent);
-        result.eventDeletion = { id: params.id };
-      },
-      async function updateStorage () {
-        const storagedUsed = await usersRepository.getStorageUsedByUserId(context.user.id);
-        // If needed, approximately update account storage size
-        if (!storagedUsed || !storagedUsed.attachedFiles) {
-          return;
-        }
+  async function deleteWithData (context, params, result, next) {
+    try {
+      await mall.events.delete(context.user.id, context.oldEvent);
+      result.eventDeletion = { id: params.id };
+      const storagedUsed = await usersRepository.getStorageUsedByUserId(context.user.id);
+      // If needed, approximately update account storage size
+      if (storagedUsed && storagedUsed.attachedFiles) {
         storagedUsed.attachedFiles -= getTotalAttachmentsSize(context.event.attachments);
         await usersRepository.updateOne(context.user, storagedUsed, 'system');
       }
-    ], next);
+      next();
+    } catch (err) {
+      next(err);
+    }
   }
   function getTotalAttachmentsSize (attachments) {
     if (attachments == null) {
       return 0;
     }
-    return _.reduce(attachments, function (evtTotal, att) {
-      return evtTotal + att.size;
-    }, 0);
+    return attachments.reduce((evtTotal, att) => evtTotal + att.size, 0);
   }
 
   api.register(
@@ -789,9 +781,7 @@ module.exports = async function (api) {
    * Returns the key of the attachment with the given file name.
    */
   function getAttachmentIndex (attachments, fileId) {
-    return _.findIndex(attachments, function (att) {
-      return att.id === fileId;
-    });
+    return attachments.findIndex(att => att.id === fileId);
   }
   /**
    * Sets the file read token for each of the given event's attachments (if any) for the given

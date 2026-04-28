@@ -9,8 +9,7 @@ const commonFns = require('./helpers/commonFunctions');
 const Registration = require('business/src/auth/registration');
 const methodsSchema = require('../schema/systemMethods');
 const string = require('./helpers/string');
-const _ = require('lodash');
-const bluebird = require('bluebird');
+const { fromCallback } = require('utils');
 const { getStorageLayer, getUsersLocalIndex } = require('storage');
 const { getConfig, getLogger } = require('@pryv/boiler');
 const { getUsersRepository } = require('business/src/users');
@@ -103,11 +102,11 @@ module.exports = async function (systemAPI, api) {
           info.callsPerAccess[accessKey] = 0;
         }
         if (access.calls) {
-          _.forOwn(access.calls, function (total, methodKey) {
+          for (const [methodKey, total] of Object.entries(access.calls)) {
             info.callsTotal += total;
             info.callsDetail[methodKey] += total;
             info.callsPerAccess[accessKey] += total;
-          });
+          }
         }
       });
 
@@ -202,7 +201,7 @@ module.exports = async function (systemAPI, api) {
 
   async function deactivateMfa (context, params, result, next) {
     try {
-      await bluebird.fromCallback(cb => userProfileStorage.findOneAndUpdate(
+      await fromCallback(cb => userProfileStorage.findOneAndUpdate(
         context.user,
         {},
         { $unset: { 'data.mfa': '' } },

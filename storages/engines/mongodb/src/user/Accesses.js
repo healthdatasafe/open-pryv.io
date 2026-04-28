@@ -7,9 +7,8 @@
 
 const BaseStorage = require('./BaseStorage');
 const converters = require('./../converters');
-const generateId = require('cuid');
+const { createId: generateId } = require('@paralleldrive/cuid2');
 const util = require('util');
-const _ = require('lodash');
 const _internals = require('../_internals');
 const logger = _internals.lazyLogger('storage:accesses');
 const timestamp = require('unix-timestamp');
@@ -34,7 +33,7 @@ function Accesses (database, integrityAccesses) {
     return accessData;
   }
 
-  _.extend(this.converters, {
+  Object.assign(this.converters, {
     itemDefaults: [
       converters.createIdIfMissing,
       createTokenIfMissing
@@ -175,7 +174,7 @@ Accesses.prototype.updateOne = function (userOrUserId, query, update, callback) 
  */
 Accesses.prototype.insertMany = function (userOrUserId, accesses, callback) {
   const accessesToCreate = accesses.map((a) => {
-    if (a.deleted === undefined) return _.assign({ deleted: null }, a);
+    if (a.deleted === undefined) return Object.assign({ deleted: null }, a);
     return a;
   });
   this.database.insertMany(
