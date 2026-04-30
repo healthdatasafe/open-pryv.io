@@ -1,5 +1,100 @@
 # Changelog - Internal (no API impact)
 
+## Bootstrap bundle schema — v2 (forward-compat-friendly)
+
+- **CHANGE** `components/business/src/bootstrap/Bundle.js`: `BUNDLE_VERSION`
+  bumped `1` → `2`. v2 adds an optional
+  `platformSecrets.letsEncrypt.atRestKey` field carrying the cluster-wide
+  AES-GCM key used by `AtRestEncryption`.
+- **CHANGE** `Bundle.validate()` accepts any version in `1..BUNDLE_VERSION`
+  (was strict equality on the current version). Producers always emit the
+  latest version; consumers reject only forward-compat unknown versions or
+  `version <= 0`. Restores graceful upgrade across mixed-version clusters
+  during the rolling-out window.
+- **CHANGE** `Bundle.assemble()` only emits `platformSecrets.letsEncrypt`
+  when the input supplies an `atRestKey` — keeps v2 bundles minimal when
+  the issuing core has no LE secret to ship. Bundle version stays `2`
+  regardless.
+- **CHANGE** `applyBundle.writeOverrideConfig()`: when the bundle ships
+  `platformSecrets.letsEncrypt.atRestKey`, write it under
+  `letsEncrypt.atRestKey` in the joiner's `override-config.yml`.
+- **CHANGE** `cliOps.newCore()` accepts `secrets.letsEncryptAtRestKey`;
+  forwards to `Bundle.assemble`. `bin/bootstrap.js` reads
+  `config.get('letsEncrypt:atRestKey')` and threads it through (only when
+  it's a real value — `REPLACE ME` placeholder is filtered out by
+  `isUsableSecret`).
+- **TESTS** `[BUNDLE]` +6 cases (omits/carries `letsEncrypt`, accepts v1
+  shape, accepts v2 shape, rejects version 0, rejects malformed
+  `letsEncrypt`); `[APPLYBUNDLE]` +1 case (writes
+  `override.letsEncrypt.atRestKey`); `[BOOTSTRAPE2E]` +1 case (issuer →
+  consumer round-trip of `atRestKey`). `just test business`: 363/0 (was
+  354).
+
+## Cluster-mode state fixes — accessState on PlatformDB + `cluster_kv` primitive
+
+A class of bugs where module-scope `new Map()` looks fine in single-process
+tests but breaks under `cluster.fork()` because each worker holds its own
+copy. Surfaced in production as a 50 % auth-poll failure rate
+(`/reg/access/:key` polls round-robin across workers; the second poll lands
+on a worker whose Map is empty).
+
+- **FIX** `components/api-server/src/routes/reg/accessState.js` — replaces
+  the in-memory `new Map()` with PlatformDB-backed storage (rqlite
+  `keyValue` rows under `access-state/<key>`). API turned async; the route
+  in `routes/reg/access.js` is now async with try/catch wrappers. POST
+  splits into `buildState()` → URL decoration (`pollUrl`/`authUrl`) →
+  `persist()` so the URLs computed from per-core routing land in the
+  stored state without an extra round-trip. Cluster-wide AND
+  restart-survivable for free; the lazy expire on `get` matches the
+  existing `tls-cert/*` posture.
+- **NEW** `storages/interfaces/platformStorage/PlatformDB.js` — four new
+  methods on the interface: `setAccessState(key, value, expiresAt)`,
+  `getAccessState(key)`, `deleteAccessState(key)`,
+  `sweepExpiredAccessStates(now?)`. rqlite engine implements them;
+  `[ACCESSSTATE]` 8 conformance cases.
+- **NEW** `components/messages/src/cluster_kv.js` — master-held key/value
+  store + worker IPC primitive for the ephemeral cross-worker state
+  class (single-core scope only; cross-core state goes to PlatformDB).
+  Wire format `kv:get/set/delete/clear` with namespaced replies. Lazy
+  expire on `get` + 60 s sweeper. In-process fallback when `process.send`
+  isn't available (single-process tests, CLI tools). Wired in
+  `bin/master.js` after `tcpPubsub.init()`. 14 unit cases under
+  `[CLUSTERKV]`.
+- **FIX** `components/business/src/mfa/SessionStore.js` +
+  `components/business/src/mfa/index.js` — MFA session store backed on
+  `cluster_kv` instead of a per-instance `Map`. API turned async
+  (`create`/`has`/`get`/`clear`/`clearAll`). Same bug family as the
+  accessState §12: login lands on worker A, verify hits worker B → "MFA
+  session not found". The header comment that said "single-core only"
+  reworded — under `cluster.fork()` "process-wide" is per-worker, not
+  per-core. `[MT5A]` cross-worker case added.
+- **NEW** `components/test-helpers/src/clusterFixture.js` +
+  `components/api-server/test/clusterWorkers/accessStateWorker.js` +
+  `components/api-server/test/access-state-cluster-seq.test.js` —
+  multi-worker test fixture (forks N children via `child_process.fork`,
+  JSON-RPC over IPC, ready handshake on boot). `[XS12A/B/C]` regression
+  cases would fail against the pre-Plan-55 in-memory Map.
+
+## Post-deps-bump fix-ups — uuid call sites + backloop.dev lazy require
+
+Two follow-ups missed when the deps bump landed; both crashed the production
+Docker image at boot before any config was read.
+
+- **FIX** `components/business/src/mfa/Profile.js` +
+  `components/business/src/mfa/SessionStore.js` — swap
+  `const { v4: uuidv4 } = require('uuid')` →
+  `const { randomUUID: uuidv4 } = require('node:crypto')`. Same alias, no
+  call-site churn. The `uuid` package was dropped from `package.json` in the
+  earlier deps bump but these two MFA files still required it; first MFA-
+  touching require chain (`api-server/methods/auth/login → mfa`) crashed
+  `MODULE_NOT_FOUND`. RFC-4122 v4 byte-equivalent.
+- **FIX** `components/api-server/src/server.js` — move
+  `require('backloop.dev').httpsOptionsAsync` from top-level into the
+  `if (config.get('http:ssl:backloop.dev'))` block. `npm install --omit=dev`
+  skips `backloop.dev` because workspace promotion marks it `"dev": true`
+  in the lockfile, so the production image has no copy on disk; lazy-require
+  keeps the dev-loop path working while letting prod boot.
+
 ## Deploy hardening — single-core LE first-boot, embedded DNS, Dockerfile
 
 A bundle of five fixes surfaced by a fresh single-core Dokku deploy with

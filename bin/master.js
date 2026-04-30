@@ -161,6 +161,14 @@ if (cluster.isPrimary) {
     await tcpPubsub.init();
     log('TCP pub/sub broker started');
 
+    // Cluster-wide ephemeral kv (Plan 55 Phase 3) — master-held Map +
+    // request/response IPC with workers. Used for state that must be
+    // shared across workers but doesn't need persistence (single-core
+    // scope; cross-core state belongs in PlatformDB instead).
+    require('../components/messages/src/cluster_kv').masterStart({
+      log: (m) => log('[cluster_kv] ' + m)
+    });
+
     // Start DNS server if configured
     let dnsServer = null;
     if (config.get('dns:active')) {
@@ -372,6 +380,37 @@ if (cluster.isPrimary) {
             log(`[mail] IPC to worker ${id} failed: ${err.message}`);
           }
         }
+      }
+    });
+
+    // Plan 54 Phase D — admin force-renew IPC. The api-server route
+    // POST /system/admin/certs/force-renew runs in a worker; it sends
+    // `acme:force-renew` to the master, which holds the AcmeOrchestrator,
+    // and waits for `acme:force-renew:reply`. Non-renewer cores reply with
+    // ok:false so the route can return a 400.
+    cluster.on('message', async (worker, msg) => {
+      if (!msg || msg.type !== 'acme:force-renew') return;
+      const reply = { type: 'acme:force-renew:reply', requestId: msg.requestId };
+      try {
+        if (acmeOrchestrator == null) {
+          worker.send({ ...reply, ok: false, error: 'letsEncrypt orchestrator not running on this core' });
+          return;
+        }
+        if (!acmeOrchestrator.isRenewer) {
+          worker.send({ ...reply, ok: false, error: 'not the certRenewer core' });
+          return;
+        }
+        const result = await acmeOrchestrator.forceRenew(msg.hostname || undefined);
+        worker.send({
+          ...reply,
+          ok: true,
+          hostname: result.hostname,
+          issuedAt: result.issuedAt,
+          expiresAt: result.expiresAt
+        });
+      } catch (err) {
+        log('[acme] force-renew failed: ' + err.message);
+        try { worker.send({ ...reply, ok: false, error: err.message }); } catch (_) {}
       }
     });
 
