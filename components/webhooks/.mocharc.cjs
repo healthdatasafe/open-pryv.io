@@ -8,6 +8,7 @@
 const { createConfig } = require('../../.mocharc.js');
 const glob = require('glob');
 
+// Auto-detect non-parallel tests by naming convention
 const nonParallelTests = [
   ...glob.sync('test/**/*-seq.test.js')
 ];
