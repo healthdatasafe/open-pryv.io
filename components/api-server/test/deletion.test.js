@@ -18,7 +18,7 @@ const SeriesRepository = require('business/src/series/repository.ts').default;
 const DataMatrix = require('business/src/series/data_matrix.ts').default;
 const { getConfig } = require('@pryv/boiler');
 const { getUsersRepository } = require('business/src/users/index.ts');
-const { databaseFixture } = require('test-helpers');
+const { databaseFixture, withInjectedConfig, injectTestConfigSnapshot } = require('test-helpers');
 const { produceStorageConnection, produceSeriesConnection } = require('api-server/test/test-helpers');
 const { removeSystemStreams } = require('test-helpers/src/systemStreamFilters.ts');
 const { pubsub } = require('messages');
@@ -74,7 +74,6 @@ describe('[PGTD] DELETE /users/:username', () => {
     mall = await getMall();
   });
   after(async function () {
-    config.injectTestConfig({});
     await mongoFixtures.context.cleanEverything();
   });
   describe('[USAD] depending on "user-account:delete"  config parameter', function () {
@@ -89,40 +88,36 @@ describe('[PGTD] DELETE /users/:username', () => {
       await user1.session(personalAccessToken);
     });
     it('[8UT7] Should accept when "personalToken" is active and a valid personal token is provided', async function () {
-      config.injectTestConfig({
-        'user-account': { delete: ['personalToken'] }
+      await withInjectedConfig({ 'user-account': { delete: ['personalToken'] } }, async () => {
+        res = await request
+          .delete(`/users/${username1}`)
+          .set('Authorization', personalAccessToken);
+        assert.strictEqual(res.status, 200);
       });
-      res = await request
-        .delete(`/users/${username1}`)
-        .set('Authorization', personalAccessToken);
-      assert.strictEqual(res.status, 200);
     });
     it('[IJ5F] Should reject when "personalToken" is active and an invalid token is provided', async function () {
-      config.injectTestConfig({
-        'user-account': { delete: ['personalToken'] }
+      await withInjectedConfig({ 'user-account': { delete: ['personalToken'] } }, async () => {
+        res = await request
+          .delete(`/users/${username1}`)
+          .set('Authorization', 'bogus');
+        assert.strictEqual(res.status, 403); // not 404 as when option is not activated
       });
-      res = await request
-        .delete(`/users/${username1}`)
-        .set('Authorization', 'bogus');
-      assert.strictEqual(res.status, 403); // not 404 as when option is not activated
     });
     it('[NZ6G] Should reject when only "personalToken" is active and a valid admin token is provided', async function () {
-      config.injectTestConfig({
-        'user-account': { delete: ['personalToken'] }
+      await withInjectedConfig({ 'user-account': { delete: ['personalToken'] } }, async () => {
+        res = await request
+          .delete(`/users/${username1}`)
+          .set('Authorization', authKey);
+        assert.strictEqual(res.status, 403); // not 404 as when option is not activated
       });
-      res = await request
-        .delete(`/users/${username1}`)
-        .set('Authorization', authKey);
-      assert.strictEqual(res.status, 403); // not 404 as when option is not activated
     });
     it('[UK8H] Should accept when "personalToken" and "adminToken" are active and a valid admin token is provided', async function () {
-      config.injectTestConfig({
-        'user-account': { delete: ['personalToken', 'adminToken'] }
+      await withInjectedConfig({ 'user-account': { delete: ['personalToken', 'adminToken'] } }, async () => {
+        res = await request
+          .delete(`/users/${username1}`)
+          .set('Authorization', authKey);
+        assert.strictEqual(res.status, 200);
       });
-      res = await request
-        .delete(`/users/${username1}`)
-        .set('Authorization', authKey);
-      assert.strictEqual(res.status, 200);
     });
   });
   // ---------------- loop loop -------------- //
@@ -161,13 +156,14 @@ describe('[PGTD] DELETE /users/:username', () => {
   ];
   [0, 1].forEach(function (i) {
     describe(`[DOA${i}] dnsLess:isActive = ${settingsToTest[i][0]}`, function () {
+      let restoreConfig;
       before(async function () {
-        config.injectTestConfig({
+        restoreConfig = injectTestConfigSnapshot({
           dnsLess: { isActive: settingsToTest[i][0] }
         });
       });
       after(async function () {
-        config.injectTestConfig({});
+        restoreConfig();
       });
       describe(`[D7H${i}] when given existing username`, function () {
         let userToDelete;
@@ -239,7 +235,16 @@ describe('[PGTD] DELETE /users/:username', () => {
         it(`[${testIDs[i][10]}] should delete user from the cache`, async function () {
           const usersExists = cache.getUserId(userToDelete.attrs.id);
           assert.strictEqual(usersExists, undefined);
-          if (pubsub.isTransportEnabled()) {
+          // Plan 61 Wave 5: only assert the synchro broadcast when caching
+          // is actually active. With caching disabled (parallel mode via
+          // initCore injecting `caching:isActive:false`), `cache.unsetUser`
+          // early-returns, no `synchro.unsetUser` notify fires, and
+          // `delivered` stays empty — which is correct because there's no
+          // cache state to invalidate. Re-read the live config since the
+          // default-exported `cache.isActive` is the by-value snapshot at
+          // module-load (still `false`), not the live mutated value.
+          const config = await getConfig();
+          if (config.get('caching:isActive') && pubsub.isTransportEnabled()) {
             assert.strictEqual(delivered.length, 1);
             assert.strictEqual(delivered[0].scopeName, 'cache.' + MESSAGES.UNSET_USER);
             assert.strictEqual(delivered[0].eventName, MESSAGES.UNSET_USER);

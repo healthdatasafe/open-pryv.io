@@ -17,7 +17,9 @@ const syncPrimitives = require('./condition_variable.ts');
 const databaseFixture = require('./databaseFixture.ts').default;
 const portAllocator = require('./portAllocator.ts');
 const parallelTestHelper = require('./parallelTestHelper.ts');
+const parallelWorkerSetup = require('./parallelWorkerSetup.ts');
 const systemStreamFilters = require('./systemStreamFilters.ts');
+const { withInjectedConfig, injectTestConfigSnapshot } = require('./withInjectedConfig.ts');
 
 // Pattern C helpers (helpers-c.ts) is NOT exported here due to circular dependency.
 // Load it directly via: require('test-helpers/src/helpers-c.ts')
@@ -41,9 +43,12 @@ export {
   databaseFixture,
   portAllocator,
   parallelTestHelper,
+  parallelWorkerSetup,
   systemStreamFilters,
   attachmentsCheck,
   data,
   dynData,
-  dependencies
+  dependencies,
+  withInjectedConfig,
+  injectTestConfigSnapshot
 };
