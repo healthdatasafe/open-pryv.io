@@ -1,5 +1,87 @@
 # Changelog - API Changes
 
+## **BREAKING** — `/reg/access` polling endpoint response shapes trimmed
+
+The access-request polling endpoints have been narrowed to expose only the fields each consumer audience actually needs. SDKs (lib-js + downstream apps) get the minimum needed to drive the flow; the auth UI (app-web-auth3 + equivalents) keeps a richer poll response.
+
+### What changed
+
+**`POST /reg/access`** (SDK-facing — create access request):
+
+The response now contains only `{ status, key, authUrl, poll, poll_rate_ms }`. Removed fields: `code`, `url` (was a v1 alias of `authUrl`), `returnUrl` (camelCase duplicate of `returnURL`), `requestingAppId`, `requestedPermissions`, `lang`, `returnURL`, `oauthState`, `clientData`, `serviceInfo`. Echoed inputs and service metadata are reachable via the GET poll path or `/service/info`.
+
+**`GET /reg/access/:key`** (auth-UI-facing on `NEED_SIGNIN`, SDK-facing on terminal states):
+
+- `code` field dropped from the body (it was always the HTTP status, already conveyed by `res.status`).
+- `url` (v1 alias of `authUrl`) and `returnUrl` (camelCase duplicate of `returnURL`) dropped.
+- `serviceInfo` is now embedded only on the `NEED_SIGNIN` poll — the only response the auth UI actually consumes for that field. SDK polling does not need it (the SDK fetches `/service/info` directly when it wants service metadata).
+- `REDIRECTED` responses now emit both `poll` (back-compat with existing SDK rehydration) and a new explicit `redirectUrl` field so consumers don't have to overload `poll`.
+
+**Refused/Error responses** (POST + GET, all forms):
+
+- The `reasonID` field has been renamed to `reasonId` to match the camelCase convention used by the auth UI and by every consumer that actually reads the field. The old `reasonID` spelling never reached any reader and was effectively dead.
+
+### Migration
+
+- SDK callers using `pryv@>=3.5.0` are unaffected — the SDK already speaks the new shapes.
+- SDK callers on `pryv@<3.5.0` that read `body.url`, `body.returnUrl`, `body.code`, or `body.reasonID` from `/reg/access` responses must switch to `authUrl` / `returnURL` / HTTP status / `reasonId` respectively, or upgrade.
+- Custom auth UIs that depend on `serviceInfo` being present on every poll must read it from the initial `NEED_SIGNIN` poll (still emitted) and cache, or fetch from `/service/info` directly. The `app-web-auth3` build shipped alongside this server release derives a fallback `/service/info` URL from the poll URL.
+
+## **BREAKING** — MongoDB removed as a user-data storage engine
+
+The MongoDB engine has been dropped from open-pryv.io. Supported user-data engines are now **PostgreSQL** (default) and **SQLite** (alternative). InfluxDB remains optional for high-frequency seriesStorage; rqlited remains the only platformStorage.
+
+### What changed at the operator surface
+
+- `storages.base.engine: mongodb` and `storages.engines.mongodb.*` config keys are gone — startup fails with a clear plugin-loader error if `engine: mongodb` is set.
+- `STORAGE_ENGINE=mongodb` test harness override is gone.
+- The `mongodb` npm dependency is removed from `package.json`; the install footprint shrinks accordingly.
+- The `storages/engines/mongodb/` plugin directory is deleted entirely.
+
+### Migration path for existing MongoDB deployments
+
+Use the engine-agnostic backup tool that has been part of the V2 release line:
+
+```bash
+# On the MongoDB-backed deployment (this build's predecessor)
+bin/backup.js --export --userid <userid>     # exports user data as a JSONL bundle
+
+# On a fresh PostgreSQL-backed deployment of this build
+bin/backup.js --restore --bundle <path>      # reads the bundle into PG
+```
+
+This is the same path used for the V1→V2 migration and for production MongoDB→PostgreSQL cutovers. Bundles include accounts, streams, events, accesses, profiles, webhooks, and attachments.
+
+### Code-level removals
+
+`components/storage/src/index.ts` drops `getDatabaseSync` + `_ensureMongoDatabase`; test-helpers `dependencies.ts` no longer imports the MongoDB collection classes; `databaseFixture.ts` drops the legacy raw-DB branches; `storages/index.ts` drops the `baseEngine === 'mongodb'` connection bootstrap branch.
+
+### Platform.deleteUser hardening
+
+Shipped alongside the engine removal: `Platform.deleteUser` now discovers PlatformDB entries by username prefix and deletes whatever is present, instead of iterating the mutable `accountStreams.{uniqueFieldNames,indexedFieldNames}` module-level lists at call time. Fixes a latent leak where a fixture user created under one `systemStreams` config couldn't be fully removed after a config change (test-only impact, but the root cause was a production-side fragility).
+
+## SQLite baseStorage — now a complete V2 alternative engine
+
+Counterpart to the MongoDB removal: the SQLite engine is now a real user-data option, not the "not yet implemented" stub that throws at init.
+
+### Engine-choice tradeoff: backup/deletion semantics, not volume
+
+The PG and SQLite engines have **different data-layout shapes**:
+
+- **PostgreSQL** holds all users' data in shared tables keyed by `user_id`. Cross-user queries are cheap; backups via `pg_dump` are a single artefact; a user's data is interspersed with other users' rows in any backup taken before that user's deletion.
+- **SQLite** (new) holds each user's data in a **per-user file** at `<userLocalDirectory>/<userId>/baseStorage-<version>.sqlite`. Deleting a user is an `unlink` — the user's data goes away cleanly, and historical backups that haven't yet included this user (or are taken per-user) don't carry the deleted user's rows by default.
+
+This shape difference matters under **GDPR Art.17 / right-to-be-forgotten** + similar privacy-preserving deletion regimes. Operators with stricter deletion semantics, per-user backup orchestration, or per-user retention policies may prefer SQLite. Operators with high-volume cross-user analytics or who already have PG operational tooling stay on PG. Neither is a "low-volume only" choice.
+
+### What ships under `storages/engines/sqlite/src/`
+
+- **Shared baseStorage SQLite** (`DatabaseSQLite`, `LocalTransactionSQLite`): single file at `<sqlite.path>/_shared/baseStorage.sqlite` for cross-user collections (Sessions, PasswordResetRequests).
+- **Per-user baseStorage** (`UserBaseStorageDb` + `BaseStorageSQLite`): per-user file at `<userLocalDirectory>/<userId>/baseStorage-<version>.sqlite`. Tables for `accesses`, `profile`, `streams`, `webhooks` with minimal schema (id / headId / deleted as columns + JSON `data` column). MongoDB-style query translation (`$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$type`/`$or`) and update operators (`$set`/`$unset`/`$inc`/`$min`/`$max` with dotted-path nested-object semantics).
+- **Collection subclasses**: `AccessesSQLite` (full mirror including integrity-batch delete + `findHistory`/`snapshotHead`), `ProfileSQLite`, `StreamsSQLite` (path computation + treeUtils tree-shape), `WebhooksSQLite` (soft-delete with the same unset list as PostgreSQL).
+- **dataStore streams** (`localUserStreamsSQLite`) wired in `localDataStoreSQLite`. Events were already implemented; the engine now ships full dataStore.
+
+Per-test SQLite matrix is clean across `audit`, `business`, `cmc`, `hfs-server`, `mall`, `storages`, etc (1225+ tests passing under `STORAGE_ENGINE=sqlite`). The `api-server` component shares a pre-existing test-helper crash with the now-removed Mongo matrix run (tracked separately) and is verified component-by-component until that is closed.
+
 ## `accesses.create` — accepts `:_cmc:*` stream-ids in permissions
 
 `accesses.create` was rejecting permissions referencing the CMC plugin's reserved namespace (e.g. `:_cmc:apps:<app-code>`, `:_cmc:inbox`) with `invalid-request-structure`: *"forbidden character(s) in streamId ':_cmc:...'"*. The auto-create-stream side-effect of personal-access app authorization was hitting the local-store streamId regex (`^[a-z0-9-]{1,100}`), which rejects the leading colon.

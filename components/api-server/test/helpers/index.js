@@ -8,8 +8,7 @@
 /**
  * Extends the common test support object with server-specific stuff.
  *
- * Plan 57 5g.4 — converted from CJS spread-mutation pattern to ESM
- * named re-exports. The previous shape:
+ * Uses ESM named re-exports rather than the CJS spread-mutation pattern:
  *
  *   exports = module.exports = { ...require('test-helpers') };
  *   exports.commonTests = require('./commonTests');
@@ -41,10 +40,9 @@ const data = tested.data;
 const dynData = tested.dynData;
 const request = tested.request;
 const databaseFixture = tested.databaseFixture;
-const InstanceManager = tested.InstanceManager;
 const DynamicInstanceManager = tested.DynamicInstanceManager;
 const instanceTestSetup = tested.instanceTestSetup;
-const spawner = tested.spawner;
+const TestServerContext = tested.TestServerContext;
 const child_process = tested.child_process; // eslint-disable-line camelcase
 const syncPrimitives = tested.syncPrimitives;
 const portAllocator = tested.portAllocator;
@@ -62,10 +60,9 @@ export {
   dynData,
   request,
   databaseFixture,
-  InstanceManager,
   DynamicInstanceManager,
   instanceTestSetup,
-  spawner,
+  TestServerContext,
   child_process, // eslint-disable-line camelcase
   syncPrimitives,
   portAllocator,

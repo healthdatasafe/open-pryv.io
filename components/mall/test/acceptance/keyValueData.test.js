@@ -7,7 +7,6 @@
 
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-// TODO: enable linting again once implementation finished
 
 /* global assert, initTests, initCore, getNewFixture, charlatan, cuid, coreRequest  */
 
@@ -16,14 +15,14 @@ require('test-helpers/src/api-server-tests-config.ts');
 describe('[KVDB] Per-store key-value DB', () => {
   let user, username, password, access;
   let personalToken;
-  let mongoFixtures;
+  let fixtures;
   let streamsPath, eventsPath;
 
   before(async () => {
     await initTests();
     await initCore();
-    mongoFixtures = getNewFixture();
-    user = await mongoFixtures.user(charlatan.Lorem.characters(7), {
+    fixtures = getNewFixture();
+    user = await fixtures.user(charlatan.Lorem.characters(7), {
       password
     });
 
@@ -40,7 +39,7 @@ describe('[KVDB] Per-store key-value DB', () => {
   });
 
   after(async () => {
-    await mongoFixtures.clean();
+    await fixtures.clean();
   });
 
   it('[2Z7L] Must set and get key-value data', async () => {

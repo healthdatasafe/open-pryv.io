@@ -31,7 +31,7 @@ function accessSchema (action: any) {
   });
   helpers.addTrackingProperties(base);
 
-  // explicitly forbid 'id' on create TODO: ignore it instead
+  // explicitly forbid 'id' on create
   if (action !== Action.CREATE) {
     base.properties.id = string();
   }
@@ -128,8 +128,15 @@ function permissions (action: any) {
     additionalProperties: false,
     required: ['streamId', 'level']
   });
-  if (action === Action.CREATE) {
-    // accept additional props for the app authorization process
+  if (action === Action.CREATE || action === Action.UPDATE) {
+    // accept additional props for the app authorization process.
+    // UPDATE matches CREATE since 2026-05-26 (was strict-only) so a caller
+    // can pipe `checkApp.checkedPermissions` (which carries these fields
+    // because checkApp uses Action.CREATE) straight into accesses.update
+    // without stripping them client-side. The server-side cleanup mirror
+    // in accesses.update's middleware chain drops them before persisting
+    // (same as the existing create cleanup) so wire-format symmetry does
+    // not change what gets stored.
     streamPermission.properties.defaultName = string({ pattern: '\\w+' /* not empty */ });
     streamPermission.properties.name = string();
   }

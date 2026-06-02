@@ -29,7 +29,7 @@ describe('[ACCO] Account with system streams', function () {
   let app;
   let request;
   let res;
-  let mongoFixtures;
+  let fixtures;
   let basePath;
   let access;
   let user;
@@ -45,7 +45,7 @@ describe('[ACCO] Account with system streams', function () {
 
   async function createUser () {
     // Use cuid for unique username to avoid parallel test conflicts
-    user = await mongoFixtures.user('accds' + cuid.slug().toLowerCase(), {
+    user = await fixtures.user('accds' + cuid.slug().toLowerCase(), {
       insurancenumber: charlatan.Number.number(4),
       phoneNumber: charlatan.Lorem.characters(3)
     });
@@ -83,7 +83,7 @@ describe('[ACCO] Account with system streams', function () {
   }
 
   before(async function () {
-    mongoFixtures = databaseFixture(await produceStorageConnection());
+    fixtures = databaseFixture(await produceStorageConnection());
     app = getApplication(true);
     await app.initiate();
     // Initialize notifications dependency
@@ -147,11 +147,6 @@ describe('[ACCO] Account with system streams', function () {
           event.streamIds.includes(addPrivatePrefixToStreamId('dbDocuments')));
         const attachedFilesAccountEvent = allVisibleAccountEvents.find(event =>
           event.streamIds.includes(addPrivatePrefixToStreamId('attachedFiles')));
-        // TODO: verify the following data or remove those lines
-        // const insurancenumberAccountEvent = allVisibleAccountEvents.find(event =>
-        //   event.streamIds.includes(addCustomerPrefixToStreamId('insurancenumber')));
-        // const phoneNumberAccountEvent = allVisibleAccountEvents.find(event =>
-        //   event.streamIds.includes(addCustomerPrefixToStreamId('phoneNumber')));
         assert.strictEqual(res.body.account.email, emailAccountEvent.content);
         assert.strictEqual(res.body.account.language, languageAccountEvent.content);
         assert.strictEqual(res.body.account.storageUsed.dbDocuments, dbDocumentsAccountEvent.content);

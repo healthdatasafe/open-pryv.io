@@ -22,16 +22,16 @@ const { getConfig } = require('@pryv/boiler');
 let isAuditActive = true;
 
 describe('[PCRO] permissions create-only level', () => {
-  let mongoFixtures;
+  let fixtures;
   before(async function () {
     await initTests();
     await initCore();
-    mongoFixtures = getNewFixture();
+    fixtures = getNewFixture();
     const config = await getConfig();
     isAuditActive = config.get('audit:active');
   });
   after(async () => {
-    await mongoFixtures.clean();
+    await fixtures.clean();
   });
 
   let user,
@@ -70,7 +70,7 @@ describe('[PCRO] permissions create-only level', () => {
   });
 
   before(async () => {
-    user = await mongoFixtures.user(username, {});
+    user = await fixtures.user(username, {});
     const streamParent = await user.stream({
       id: streamParentId,
       name: 'Does not matter at all'
@@ -354,8 +354,8 @@ describe('[PCRO] permissions create-only level', () => {
 
       describe('[PC11] PUT /', function () {
         it('[1WXJ] should forbid updating accesses', async function () {
-          // Plan 66: shared accesses (incl. create-only) cannot update
-          // anything — canUpdateAccess returns false → 403 forbidden.
+          // Shared accesses (incl. create-only) cannot update anything
+          // — canUpdateAccess returns false → 403 forbidden.
           const res = await coreRequest
             .put(reqPath(readAccessId))
             .set('Authorization', createOnlyToken)

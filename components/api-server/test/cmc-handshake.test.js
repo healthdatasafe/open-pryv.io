@@ -310,14 +310,14 @@ describe('[CMCHS] cmc two-user handshake (in-process integration)', function () 
   // idempotency test, but leaves earlier handshakes' remote-stream
   // pointers stale, which would break CN15-CN17 / CN18.
 
-  // --- Extended in-process scenarios (ported from _plans/68/tests/) ---
+  // --- Extended in-process scenarios ---
   //
   // The CN12-CN14 block above covers the canonical handshake:
   //   request → accept → back-channel + chat (one-way) + accept re-delivery.
   // The extended block below covers the bidirectional / post-acceptance
-  // flows the deployed-infra scripts used to validate, but which can be
-  // exercised in-process via the same fetch shim. The KEEP-as-deployed
-  // scenarios (02 cross-cores, 03 cross-infra) remain in _plans/68/tests/.
+  // flows, exercised in-process via the same fetch shim. Deployed-infra
+  // scenarios (cross-cores, cross-infra) are exercised by separate
+  // deployment tests.
   //
   // These tests establish their OWN fresh handshake (study-ext / study-su)
   // rather than re-use CN12's. The current back-channel matcher
@@ -484,29 +484,39 @@ describe('[CMCHS] cmc two-user handshake (in-process integration)', function () 
     let bobDataGrantId; // bob's counterparty access pointing to alice
 
     /**
-     * Find on `actor`'s mall the access whose clientData.cmc identifies
-     * `peerUsername` as the counterparty AND whose stored remoteChat
+     * Poll `actor`'s accesses until one matches: clientData.cmc identifies
+     * `peerUsername` as the counterparty AND its stored remoteChat
      * stream-id sits under `expectedScope`. Disambiguates between
      * multiple counterparty accesses to the same peer.
+     *
+     * `runFreshHandshake` returns when the back-channel-cmc EVENT lands
+     * on bob's inbox, but bob's counterparty access is updated via a
+     * separate async path (cmc post-hook + pubsub). On heavily loaded
+     * runs (`just test all` matrix) that update can land a few hundred
+     * ms after the inbox event. Polling here aligns the two paths.
      */
-    async function findCounterpartyAccessForScope (actor, peerUsername, expectedScope) {
-      const res = await coreRequest.get(actor.accessesPath)
-        .set('Authorization', actor.token);
-      const accesses = res.body?.accesses || [];
-      return accesses.find((a) => {
-        const cmc = a?.clientData?.cmc;
-        if (cmc?.role !== 'counterparty') return false;
-        if (cmc?.counterparty?.username !== peerUsername) return false;
-        const rcs = cmc?.counterparty?.remoteChatStreamId;
-        return typeof rcs === 'string' && rcs.startsWith(expectedScope + ':chats:');
-      });
+    async function pollCounterpartyAccessForScope (actor, peerUsername, expectedScope) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < POLL_TIMEOUT_MS) {
+        const res = await coreRequest.get(actor.accessesPath)
+          .set('Authorization', actor.token);
+        const accesses = res.body?.accesses || [];
+        const match = accesses.find((a) => {
+          const cmc = a?.clientData?.cmc;
+          if (cmc?.role !== 'counterparty') return false;
+          if (cmc?.counterparty?.username !== peerUsername) return false;
+          const rcs = cmc?.counterparty?.remoteChatStreamId;
+          return typeof rcs === 'string' && rcs.startsWith(expectedScope + ':chats:');
+        });
+        if (match != null) return match;
+        await sleep(POLL_INTERVAL_MS);
+      }
+      throw new Error('poll timeout: counterparty access with back-channel under ' + expectedScope + ' for peer ' + peerUsername);
     }
 
     before(async function () {
       h = await runFreshHandshake('study-su');
-      const dg = await findCounterpartyAccessForScope(bob, alice.username, h.triggerStreamId);
-      assert.ok(dg != null,
-        'expected bob to have a counterparty access whose back-channel points to ' + h.triggerStreamId);
+      const dg = await pollCounterpartyAccessForScope(bob, alice.username, h.triggerStreamId);
       bobDataGrantId = dg.id;
     });
 
@@ -797,9 +807,9 @@ describe('[CMCHS] cmc two-user handshake (in-process integration)', function () 
       const leafStreamId = ':_cmc:apps:' + appCode;
 
       // Update to add the per-app perm. Route auto-wraps body into {update}.
-      // accesses.update schema is strict — rejects `defaultName` (per
-      // [B-2026-05-14-4] permissions-shape schema asymmetry between
-      // accesses.create / .checkApp / .update). Send the bare perm shape.
+      // accesses.update now accepts the same `defaultName`/`name` extras as
+      // accesses.create (B-2026-05-14-4 symmetry fix); kept bare here so the
+      // test exercises the minimal canonical shape.
       const updateRes = await coreRequest.put(alice.accessesPath + '/' + accessId)
         .set('Authorization', alice.token)
         .send({

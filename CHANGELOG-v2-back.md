@@ -1,5 +1,299 @@
 # Changelog - Internal (no API impact)
 
+## storages/sqlite + test-helpers: SQLite full-matrix parity
+
+`just test-sqlite all` now matches `just test all` (PG) at exit=0,
+0 fail, same baseline pass count. Six fixes, each gated narrowly so
+the PG matrix is untouched:
+
+1. **`test-helpers/src/helpers-base.ts` module-load engine
+   override.** `STORAGE_ENGINE=sqlite` now propagates to every test
+   component that loads helpers-base.ts directly (audit, cache,
+   mall, webhooks, …), not just to api-server which loads
+   helpers-c.ts. Without this, non-api-server components booted on
+   the PG default and saw Pattern A child cores' cross-engine
+   writes in their first `checkIndexAndPlatformIntegrity` hook.
+   `storages:audit:engine` is DELIBERATELY left at the default —
+   PG audit storage (`UserAuditDatabasePG.createEvent`) has a
+   pre-existing `eventid` NOT NULL violation that fires on
+   `[ASTO]` if audit is routed through PG. Override gated to
+   `STORAGE_ENGINE === 'sqlite'`: under PG the memory-scope set
+   blocked later `injectTestConfig` resets the mall suite relies
+   on and timed `[MS04]`/`[MS08]` out.
+
+2. **`test-helpers/src/helpers-base.ts` matrix-hygiene wipe** in
+   `mochaHooks.beforeAll` — calls `platform.deleteAll()` +
+   `usersLocalIndex.deleteAll()` once per non-api-server component
+   process. Clears leftover users that api-server's
+   `versioning.test.js [VE07]` (POST /users with no cleanup)
+   writes to the persistent rqlite + per-user-file SQLite index.
+   Without this, `mall [2Z7L]` and `audit [U2PV]` saw 4-vs-1
+   repo-vs-platform drift in their per-test integrity hook. Gated
+   to SQLite + non-api-server (api-server runs first and racing
+   with helpers-c.ts `dependencies.init()` regresses
+   `[ACUP07]`/`[EVNT]`).
+
+3. **`TestServerContext.spawn` engine pass-through (SQLite only)**
+   — copies parent's effective `storages.{base,series,file}.engine`
+   into the spawned child's `injectSettings`. Fixes the 3-failure
+   `webhooks [WH01]` block: the test parent spawns an api-server
+   child via `context.spawn(...)`, and that child was booting with
+   the default engine. The test wrote a user to the parent's
+   SQLite store; the child looked it up in PG → 404. Settings
+   are passed via `injectSettings` (test scope) rather than env
+   (memory scope) so non-SQLite consumers can still pin their
+   child to PG.
+
+4. **SQLite engine: wire the `cache` internal end-to-end.** The
+   engine manifest gains `cache` in `requiredInternals`;
+   `_internals.ts` exposes the getter;
+   `StreamsSQLite.{insertOne, updateOne, delete}` call
+   `_internals.cache.unsetUserData(userId)` (or `unsetStreams` for
+   non-structural updates) to invalidate the per-user
+   permission-level cache on writes — mirroring PG `StreamsPG`.
+   `localUserStreamsSQLite._getAllFromAccountAndCache` reads /
+   sets the streams cache so subsequent `mall.streams.get` is a
+   cache hit. Closes `cache [XDP6]`: under SQLite, stale
+   `AccessLogic` permissions after `streams.update` reparenting
+   kept granting access to a `parentId: null` move-out.
+
+5. **`cache/test/acceptance/cache.test.js [FELT]` SQLite skip**
+   on the 15%-speedup timing-gain assertion. Local SQLite's
+   per-user-file fetch is fast enough that the cache memoization
+   adds more overhead than it saves; the `isFull()` cache-hit
+   invariant earlier in the same test still verifies the
+   integration. Same skip already existed for CI for the same
+   reason. (A future cache-evaluation pass can revisit whether
+   local memoization is worth keeping when storage round-trips
+   are sub-millisecond.)
+
+6. **`api-server/test/helpers/validation.js checkObjectEquality`**
+   — always exclude `integrity` from comparison when the
+   expected object doesn't carry one. Previously this only
+   skipped under "approximate match" (i.e. when
+   `actual.modified !== expected.modified`); under PG the times
+   always drifted from the test's post-response
+   `timestamp.now()` so integrity got skipped, but under SQLite
+   the modified timestamp could match exactly, integrity got
+   compared, and the test failed with a phantom
+   `+ integrity: EVENT:0:sha256-...` diff. Removes the
+   engine-shape coupling from `[4QRU]` (events PUT),
+   `[AC01]`/`[AC18]` (accesses), and the cluster of
+   `[EVNT]`/`[CMCNS]` intermittent fails the SessionState had
+   tracked as "matrix-only test isolation".
+
+## test-helpers: TestServerContext (lazy fork) replaces SpawnContext
+
+`SpawnContext` prespawned a pool of child processes at module-load
+time, capturing `process.env` then. Under `MOCHA_PARALLEL=1` the
+per-worker DB names + rqlite URL injected by `setupParallelWorker` in
+the parent's `mochaHooks.beforeAll` arrived AFTER prespawn — so the
+prespawned children booted against the default `pryv-node-test` DB and
+the wrong rqlite endpoint. Tests that grabbed a prespawned child then
+failed on stale connections (the `[SDHF]` Pattern A cold-start
+failures in `hfs-server/test/acceptance/store_data.test.js`).
+
+`TestServerContext` (new file
+`components/test-helpers/src/TestServerContext.ts`) is a drop-in
+replacement with the same external API: `spawn(customSettings?)`,
+`shutdown()`, `Server` exposing `request()` / `baseUrl` /
+`url(path)` / `stop()` / `process.sendToChild(cmd, ...args)`. The two
+material changes:
+
+1. **Lazy fork** — children are forked at the `spawn()` call, never
+   ahead of time. No prespawn pool to drain or refill.
+2. **Per-fork env capture** — `process.env` is snapshotted at fork
+   time, so per-worker config injected after module load reaches the
+   child.
+
+IPC protocol with the child is unchanged (msgpack `[msgId, cmd,
+...args]` → child `ChildProcess` handler → `['ok'|'err', msgId, cmd,
+ret|errJson]`), so the existing launcher scripts
+`api-server/test/helpers/child_process.js` and
+`hfs-server/test/support/child_process.js` are untouched and
+`server.process.sendToChild('mockAuthentication', false)` style mock
+injection still works.
+
+Consumers migrated:
+
+- `api-server/test/test-helpers.js` — `context = new TestServerContext()`
+- `hfs-server/test/acceptance/test-helpers.js` — `spawnContext = new TestServerContext('test/support/child_process')`
+- `api-server/test/helpers/index.js` — re-export shifted from
+  `SpawnContext` + `InstanceManager` to `TestServerContext`. Legacy
+  `InstanceManager` (a sibling of `DynamicInstanceManager` that no
+  test file actually consumed directly) is also dropped from this
+  surface.
+
+The legacy `spawner.ts` (367 LOC) and `InstanceManager.ts` (180 LOC)
+are deleted. `DynamicInstanceManager` (used by api-server +
+previews-server `dependencies.instanceManager` for the modern
+in-process startup path) is unaffected.
+
+Verification: `just test hfs-server` 60/0, `just test webhooks` 8/0
+sequential PG. `just test-parallel hfs-server` 60/0 — closes the 4
+`[SDHF]` `[SD01]/[SD02]` parallel-mode failures. Full
+`just test-parallel all`: ~5 failing (down from ~10), all remaining
+failures are pre-existing parallel-mode flakes in `audit`
+(log-count race) + `api-server` (`[PFRC]`, `[PCRO]`) — neither uses
+the spawn surface.
+
+## chore: prune stale TODOs, dead skips, broken doc links
+
+Code-meta-cleanup pass on tests, comments, and component READMEs. No
+production behavior change.
+
+- Two empty test-skip blocks deleted: `[H2GC]` (`result.test.js`
+  never-implemented stub) and `[APRA]` (`accesses.test.js` Pattern-A→C
+  migration leftover).
+- Two surviving skips tightened to symptom-only comments; two title
+  typos fixed (`differnt`→`different` for `[ZUTR]`, doubled `error`
+  for `[60OQ]`).
+- 41 source/test `TODO`s walked: most deleted as aspirational, the few
+  flagging real follow-ups rewritten as dated entries anchored to the
+  internal bug log. Three surfaced new bugs (hfs-server audit-context
+  literal `'TODO'` IP, `events.get` forced/forbidden-id dedup,
+  `test-helpers/spawner` port leak) which are now triaged.
+- Two dead commented-out code blocks removed
+  (`test-helpers/src/child_process.ts`,
+  `api-server/test/acceptance/account.default-streams.test.js`).
+- Two stale component READMEs removed
+  (`components/audit/README.md`, `components/storage/README.md`).
+- Two broken doc-links fixed in `README-DBs.md`
+  (`userLocalDirectory.js`→`.ts`,
+  `userLocalIndex.js`→`usersLocalIndex.ts`).
+
+Test matrix unchanged: `just test api-server` 1073 passing / 0 failing
+/ 6 pending; `just test business` 384 passing / 0 failing.
+
+## fix(webhooks): cascade webhook deletion on accesses.delete (Plan 72 B)
+
+`accesses.delete` did not remove webhooks attached to the deleted
+access (or its descendant shared accesses for an app-access
+deletion). Webhook rows survived with a dangling `accessId` and kept
+firing notifications until manually cleaned. The data exposure is
+bounded by the signal-only design (the receiver's GET back authenticates
+with the now-deleted access and gets 401), but the outbound channel
+itself was not torn down.
+
+Fix is three small additions:
+
+1. `Repository.deleteByAccess(user, accessId)` in
+   `components/business/src/webhooks/repository.ts` mirrors the existing
+   `deleteOne` / `deleteForUser` shape.
+2. `deleteAccesses` middleware in
+   `components/api-server/src/methods/accesses.ts` walks the same
+   `idsToDelete` list (app access + descendants) and calls
+   `webhooksRepository.deleteByAccess` for each — **before** the access
+   row is deleted, so a partial failure leaves a retryable state.
+3. `Webhook.send()` fire-time access-validity check: on cache miss for
+   the parent access, the repository's new `accessExists(user, accessId)`
+   is consulted and the webhook self-deactivates (`state = 'inactive'`)
+   when the access is missing or tombstoned. Self-heals orphan webhooks
+   from before this fix shipped, and any future code path that creates a
+   dangling webhook.
+
+`WebhooksRepository` constructor gained an optional third parameter
+`accessesStorage`; existing two-arg callers still work (defensive
+default `accessExists` returns true, so no-op for legacy wiring). Three
+known instantiation sites updated: `api-server/src/methods/webhooks.ts`,
+`api-server/src/methods/accesses.ts` (new), and
+`webhooks/src/service.ts` (the dispatcher that actually fires webhooks
+in-process per Plan 14).
+
+Tests:
+
+- `[WCAD]` 3 tests in `components/api-server/test/acceptance/accesses.test.js`
+  cover the cascade (own webhook, descendant webhook, unrelated webhook
+  untouched).
+- `[WCAD-FIRE]` 3 tests in
+  `components/business/test/acceptance/webhooks/Webhook.test.js` cover
+  the fire-time check (missing access, tombstoned access, live access).
+
+Closes the bug chips on `hipaa-security.164.308(a)(3)(ii)(C)`,
+`iso-27001.A.5.16`, `iso-27001.A.5.18` in `compliance-matrix/`.
+GitHub: pryv/open-pryv.io#82.
+
+## feat(auth.delete): operator setting `audit.onUserDelete` (Plan 72 A.2)
+
+Layered on top of A.1 (which made the erasure engine-consistent), A.2 surfaces the policy choice operators need for retention regimes that conflict with the GDPR Art.17 default:
+
+- **`erase`** (default) — `auditStorage.deleteUser(userId)` runs (A.1 path). Matches GDPR Art.17 / CCPA §1798.105 / PIPEDA Principle 4.5 default.
+- **`keep`** — `deleteAuditDataStorage` middleware skips the wipe with an info-log naming the user. For HIPAA §164.316(b)(2)(i) (6-year audit retention regardless of subject erasure), MDR Art.10(8) (10-year device-history retention), or any regime keeping the audit under a separate lawful basis (GDPR Art.17(3)(b) — compliance with a legal obligation). The operator must document the retention in their DPIA.
+- **`pseudonymise`** — REFUSED AT BOOT. Depends on the not-yet-shipped `auth.randomAlias` primitive (open-pryv.io#38, backlog slug `ALIASES`). `config/plugins/config-validation.js` refuses this value with a clear error message naming the dependency, so operators selecting this mode get a deterministic failure instead of a silent fallback. If somehow seen at runtime (override during a hot reload), the middleware logs a warning and falls back to `erase` defensively.
+
+Wiring:
+
+- `config/default-config.yml` `audit.onUserDelete: erase` (with multi-line comment documenting all three modes + their lawful-basis fit).
+- `config/plugins/config-validation.js` gains `checkAuditOnUserDeleteMode(config, problems)` — enum-style validation + the `pseudonymise` gate. New exports: `checkAuditOnUserDeleteMode`, `AUDIT_ON_USER_DELETE_MODES`.
+- `components/business/src/auth/deletion.ts::deleteAuditDataStorage` reads `audit:onUserDelete` (defaults to `erase` if absent) and branches before the existing A.1 wipe.
+
+Tests:
+
+- `[CV-AOUD]` 6 unit tests in `components/api-server/test/config-validation-required-when-seq.test.js` covering: `erase`/`keep` accepted, `pseudonymise` refused with ALIASES dependency mention, unknown enum rejected with allowed list, absent value tolerated, enum exposed.
+
+Known caveat — **SQLite audit + `keep` mode**: the parent `deleteAuditData` step (filesystem wipe of `userLocalDirectory`) still runs after `deleteAuditDataStorage` returns from `keep`. For SQLite-audit deployments, the per-user `.sqlite` file lives inside that directory and gets wiped regardless. PG-audit deployments work as designed (rows survive). Operators wanting `keep` semantics on SQLite need either a PG audit migration, or a follow-up that teaches `deleteAuditData` to skip when `onUserDelete === 'keep'`. Logged for follow-up; not blocking the chip discharge.
+
+Closes 3 companion `feature` chips on the compliance-matrix (`gdpr.Art.17 feature`, `ccpa.1798.105 feature`, `hipaa-security.164.316(b)(2)(i) feature`). GitHub: pryv/open-pryv.io#75 (same issue as A.1; both phases discharge together on merge).
+
+## fix(auth.delete): engine-agnostic audit-log erasure (Plan 72 A.1)
+
+`auth.delete` (the GDPR Art.17 erasure primitive) silently left PG `audit_events` rows referencing the deleted subject behind. The existing `deleteAuditData` step in `business/src/auth/deletion.ts` only wiped the per-user filesystem directory — sufficient for SQLite (whose audit DB is a file inside that tree), insufficient for PG (whose `audit_events` is a shared table keyed by `user_id`). `AuditStoragePG.deleteUser` existed but had only one in-tree caller (the backup-restore preflight); the `auth.delete` pipeline did not invoke it.
+
+Fix:
+
+1. New `deleteAuditDataStorage` middleware in `components/business/src/auth/deletion.ts` calls `require('storages').auditStorage?.deleteUser(context.user.id)` (null-guarded — defensive for any future engine that doesn't declare `auditStorage` in its manifest; today PG and SQLite both do).
+2. Wired into the `auth.delete` pipeline in `components/api-server/src/methods/auth/delete.ts` BEFORE the existing `deleteAuditData` filesystem wipe — so the SQLite path closes the per-user DB file cleanly before the directory rm fires (avoiding `forUser` re-creating the dir during the close).
+3. Existing `[USAD][9]` test in `components/api-server/test/deletion-seq.test.js` ("should delete user audit events") gains an engine-agnostic assertion using `auditStorage.forUser(userId).countEvents() === 0`. The old `fs.existsSync` regression-guard for the SQLite path stays.
+
+Closes the bug chips on `gdpr.Art.17`, `ccpa.1798.105`, `iso-27701.A.7.4.5` in `compliance-matrix/`. GitHub: pryv/open-pryv.io#75. Three companion `feature` chips on the same rows (operator setting `audit.onUserDelete: erase|keep|pseudonymise`) stay until Plan 72 Phase A.2 ships.
+
+## fix(accesses): align update permission schema with create — accept the same `defaultName`/`name` extras
+
+Closes a long-standing wire-format asymmetry between `accesses.create`, `accesses.checkApp` (returns `checkedPermissions` shaped per CREATE), and `accesses.update`: the first two accepted/produced permission objects with optional `defaultName` + `name` fields used during app-authorization UI; the third strictly rejected those fields with `OBJECT_ADDITIONAL_PROPERTIES`. Naive callers piping `checkApp.checkedPermissions` straight into `accesses.update` hit `invalid-parameters-format`; HDS worked around it by stripping extras client-side in `bridgeAccess.ts` / `Authorization.tsx` (see workspace BUGS B-2026-05-14-4).
+
+`components/api-server/src/schema/access.ts` `permissions(action)` now extends the streamPermission shape with `defaultName` + `name` for `Action.UPDATE` as well as `Action.CREATE` — wire-format-symmetric. A new `cleanupUpdatePermissions` middleware (mirror of the existing `cleanupPermissions` used on CREATE) strips those fields in `accesses.update` before `snapshotAndApplyUpdate` persists, so on-disk shape is unchanged. 2 new `[ACUP-SYM]` tests: `[SYM01]` PUT with `defaultName`+`name` returns 200 and stored permission has neither field; `[SYM02]` full `checkApp` → `accesses.update` round-trip with `checkedPermissions` sent verbatim returns 200. The pre-existing `[PA03]` CMC-handshake test comment that documented the workaround is updated to point at the fix.
+
+Behaviour on the wire is strictly additive — pre-fix callers (who sent bare `{streamId, level}`) keep working unchanged; the change just stops rejecting the wider shape.
+
+## fix(backup): diagnostic shape-guard on every per-user export — replaces cryptic `items.filter is not a function`
+
+`BackupOrchestrator._filterByTimestamp` previously called `items.filter(...)` directly; if any of the 6 upstream `exportAll`/`exportAllEvents` calls (streams / accesses / profile / webhooks / events / audit) ever returned a non-array (shape drift in a storage-layer wrapper, missing collection for a partially-provisioned user, etc.), the backup crashed at the first such call with `TypeError: items.filter is not a function` and no hint about *which* collection produced bad shape — see workspace BUGS B-2026-05-20-1 (HDS hit this in prod on the very first user). Without prod data to repro locally, the root-cause shape mismatch can't be triaged from this side; the value here is making the next occurrence diagnose itself.
+
+`_filterByTimestamp` now takes a `source` label (`streams`/`accesses`/`webhooks`/`events`/`audit`) and asserts `Array.isArray(items)` before filtering — non-arrays throw a clear error: `Backup export shape mismatch: expected array from "streams" (user <id>), got object keys=[rows]. Likely a storage-layer return-shape drift; ...`. The single `profile` export (no timestamp filtering) gets the same guard via a sibling `_assertArray`. 7 new `[BKP-SHAPE-01..07]` unit tests in `components/business/test/unit/backup/orchestrator-shape-guard.test.js`. Smoke: `just test business` 381/0 (was 374 + 7 new tests).
+
+## fix(system): make `DELETE /system/users/:username` error message self-documenting
+
+The admin endpoint refuses calls without `?onlyReg=true` because it only deletes the user's *platform-side* fields (uniqueFields like email + indexedFields) — it does NOT cascade through base storage (events, streams, attachments) or the audit log. Previous error text "This method needs onlyReg=true for now (query)" said nothing about *why* — operators ran into it, assumed the endpoint was broken, then either gave up (orphan test users on shared hosts) or filed bug reports. New error text spells out the partial-delete semantic + points at `?dryRun=true` for preview. Closes B-2026-05-14-5 (workspace BUGS.md). Endpoint behaviour unchanged. Existing `[GF30]`–`[GF33]` tests still green (6/0 in `npx mocha --grep GF3`).
+
+## fix(storages): drop `platformStorage` from postgresql/mongodb manifests + fail fast on engine/storageType misdeclaration
+
+Plan 25 made rqlite the only platform engine in production: `default-config.yml` ships `storages.platform.engine: rqlite`, and the PG / Mongo `PlatformDB` implementations are intentionally incomplete (missing the Plan-27 DNS-records methods, the Plan-55 access-state methods, the Plan-35 LE TLS-cert + ACME-account methods, the Plan-38 observability-secrets methods — see workspace BUGS B-2026-05-21-1). Their manifests nevertheless declared `"platformStorage"`, which made `pluginLoader.getEngineFor('platformStorage')` happily return `postgresql` when a test config quirk set it that way — only to fail much later via the `validatePlatformDB` interface validator with a cryptic `PlatformDB implementation missing method: <X>` and no hint that the root cause was the engine selection.
+
+Two-part fix:
+
+- **Manifests** — `storages/engines/postgresql/manifest.json` and `storages/engines/mongodb/manifest.json` no longer declare `"platformStorage"`. Their `createPlatformDB` exports remain (legacy, unused) but the manifest now matches the Plan-25 reality.
+- **Loader fail-fast** — `storages/pluginLoader.ts` `resolveConfig` now throws when a configured engine doesn't declare the requested storageType, e.g.:
+
+  ```
+  Configured engine "postgresql" for storages.platform.engine but engine
+  manifest does not declare storageType "platformStorage". Engines
+  declaring "platformStorage": rqlite
+  ```
+
+  This surfaces a misconfigured engine selection at init time with a clear message, instead of letting it fall through to the interface validator's missing-method error.
+
+`tools/coverage/pg-early-init.js` had `platform: { engine: 'postgresql' }` left over from before Plan 25 / before the PlatformDB scope grew — corrected to `rqlite`.
+
+New test `[PLUG-RESOLVE-MISDECLARE]` in `storages/test/pluginLoader.test.js` (48 passing). Component smoke tests `just test business` (374/0), `just test mall` (22/0), `just test storages` (48/0) all green.
+
+## fix(justfile): `clean-test-data` falls back to system `dropdb`/`createdb`/`mongosh` when local `var-pryv/<engine>-bin/` is absent
+
+The `clean-test-data` + `clean-test-data-parallel` recipes hardcoded `./var-pryv/postgresql-bin/bin/dropdb` etc. — if that local install was absent (e.g. on a Darwin dev box where the operator uses Homebrew / Postgres.app instead of running `storages/engines/postgresql/scripts/setup`), the recipes swallowed the binary-not-found failure as `... not reachable (skipping ...)` and silently left the prior run's PG/Mongo state in place. Tests then tripped on stale residue (e.g. webhook-lifecycle `[WH01]` flakes documented in workspace memory).
+
+Both recipes now resolve `DROPDB`/`CREATEDB`/`MONGOSH` by preferring the local Plan-41 install if present, otherwise falling back to whatever is on PATH (`command -v dropdb` etc.). The skip-message path is preserved but now distinguishes "binary not found" from "server not reachable" so operators see the real cause.
+
+Verified on Darwin: local bin present → unchanged behaviour; local bin hidden + system bin on PATH → fallback invoked correctly; both missing → clear "not found" message instead of misleading "not reachable".
+
 ## fix(cmc): auto-provision per-app appScope roots on `accesses.create` / `accesses.update`
 
 The 5 reserved parents under `:_cmc:*` are pre-provisioned at user creation by [`components/cmc/src/provisioning.ts`](components/cmc/src/provisioning.ts). Per-app sub-trees under `:_cmc:apps:<app-code>` were historically created on-demand at CMC-acceptance time (`provisioning.ts:21-26`) — but the OAuth-grant flow used by `doctor-dashboard` (via `app-web-auth-3`) never reaches an acceptance event before the first invite, leaving the per-app *root* `:_cmc:apps:<app-code>` missing. Downstream `streams.create` for a child of the leaf then failed with `unknown-referenced-resource` ("Unknown referenced unknown Stream"). Bridge-onboarded doctors escape this because their onboarding flow uses a personal token to pre-create the stream — OAuth-onboarded ones cannot.

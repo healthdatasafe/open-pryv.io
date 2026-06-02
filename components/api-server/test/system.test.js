@@ -36,28 +36,28 @@ const { getConfig } = require('@pryv/boiler');
 require('date-utils');
 
 describe('[SYRO] system route', function () {
-  let mongoFixtures;
+  let fixtures;
   let username;
   let config;
 
-  // Plan 61 Wave 7: migrated from legacy SpawnContext/ProcessProxy to
-  // DynamicInstanceManager. Outer `server = helpers.dependencies.instanceManager`
-  // (line 24) is now the live target — no inner shadowing. `server.request()`
-  // (ProcessProxy supertest helper) replaced with `helpers.request(server.url)`;
-  // `server.url()` (method) replaced with `server.url` (property).
+  // Uses DynamicInstanceManager. Outer `server =
+  // helpers.dependencies.instanceManager` (line 24) is the live target
+  // — no inner shadowing. Callsites use `helpers.request(server.url)`
+  // and `server.url` (property) rather than the legacy ProcessProxy
+  // `server.request()` and `server.url()` method.
   before(async function () {
     config = await getConfig();
-    mongoFixtures = databaseFixture(await produceStorageConnection());
+    fixtures = databaseFixture(await produceStorageConnection());
     username = 'system-test';
     await server.ensureStartedAsync(helpers.dependencies.settings);
   });
   after(async () => {
-    await mongoFixtures.clean();
+    await fixtures.clean();
     await testData.cleanup();
   });
 
   before(async () => {
-    await mongoFixtures.user(username, {});
+    await fixtures.user(username, {});
   });
 
   it('[JT1A] should parse correctly usernames starting with "system"', async () => {
@@ -91,7 +91,7 @@ describe('[SYRO] system route', function () {
       mfaPath = `/system/users/${username}/mfa`;
       profilePath = `/${username}/profile/private`;
       restOfProfile = { restOfProfile: { something: '123' } };
-      const user = await mongoFixtures.user(username);
+      const user = await fixtures.user(username);
       await user.access({
         type: 'personal',
         token
@@ -124,7 +124,7 @@ describe('[SYRO] system route', function () {
 });
 
 describe('[SYER] system (ex-register)', function () {
-  let mongoFixtures;
+  let fixtures;
 
   this.timeout(5000);
   function basePath () {
@@ -132,13 +132,13 @@ describe('[SYER] system (ex-register)', function () {
   }
 
   before(async function () {
-    // Plan 61 Wave 7: explicit DIM start. In sequential mode another
-    // Pattern-A test would have started DIM earlier and left it running
-    // (cross-file state). In parallel mode each file is its own worker,
-    // so [SYER] must start its own server.
+    // Explicit DIM start. In sequential mode another Pattern-A test
+    // would have started DIM earlier and left it running (cross-file
+    // state). In parallel mode each file is its own worker, so [SYER]
+    // must start its own server.
     await server.ensureStartedAsync(helpers.dependencies.settings);
-    mongoFixtures = databaseFixture(await produceStorageConnection());
-    await mongoFixtures.context.cleanEverything();
+    fixtures = databaseFixture(await produceStorageConnection());
+    await fixtures.context.cleanEverything();
   });
 
   beforeEach(function (done) {
@@ -149,7 +149,7 @@ describe('[SYER] system (ex-register)', function () {
   });
 
   after(async function () {
-    await mongoFixtures.context.cleanEverything();
+    await fixtures.context.cleanEverything();
   });
   // NOTE: because we mock the email sending service for user creation and to
   // keep test code simple, test order is important. The first test configures
@@ -177,7 +177,7 @@ describe('[SYER] system (ex-register)', function () {
 
     describe('[SY03] when email sending really works', function () {
       before(async function () {
-        await mongoFixtures.context.cleanEverything();
+        await fixtures.context.cleanEverything();
       });
       it('[FUTR] must create a new user with the sent data, sending a welcome email', async function () {
         const settings = structuredClone(helpers.dependencies.settings);
@@ -387,7 +387,7 @@ describe('[SYER] system (ex-register)', function () {
         });
 
       it('[NPJE] must return a correct 400 error if a user with the same email address already exists', async () => {
-        const existingUser = await mongoFixtures.user(charlatan.Lorem.characters(10));
+        const existingUser = await fixtures.user(charlatan.Lorem.characters(10));
         const data = {
           username: charlatan.Lorem.characters(10),
           passwordHash: '$-1s-b4d-f0r-U',

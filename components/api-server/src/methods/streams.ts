@@ -27,7 +27,7 @@ const Readable = require('stream').Readable;
  */
 export default async function (api: any) {
   const config = await ready();
-  // Plan 70 §2C: lazy getter instead of slice capture.
+  // Lazy getter instead of slice capture.
   const getUpdates = () => config.get('updates');
   const mall = await getMall();
   // RETRIEVAL
@@ -55,7 +55,6 @@ export default async function (api: any) {
     let streamId = params.id || params.parentId || '*';
     let storeId = params.storeId; // might me null
     if (storeId == null) {
-      // TODO: clarify smelly code (replace full stream id with in-store id?)
       [storeId, streamId] = storeDataUtils.parseStoreIdAndStoreItemId(streamId);
     }
     let streams = await mall.streams.get(context.user.id, {
@@ -126,7 +125,6 @@ export default async function (api: any) {
     let streamId = params.id || params.parentId || '*';
     let storeId = params.storeId; // might me null
     if (storeId == null) {
-      // TODO: clarify smelly code (replace full stream id with in-store id?)
       [storeId, streamId] = storeDataUtils.parseStoreIdAndStoreItemId(streamId);
     }
     try {

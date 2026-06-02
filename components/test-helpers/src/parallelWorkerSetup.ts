@@ -8,14 +8,14 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
 /**
- * Plan 61 Stage 3 — per-worker parallel-test harness.
+ * Per-worker parallel-test harness.
  *
  * Consumes the §2D contract documented at
  * `open-pryv.io/docs/storage-isolation-for-parallel-tests.md`:
  *
  *   - applies a deterministic set of per-worker config overrides
  *     (PG database name, SQLite path, rqlite ports + dataDir, http ports,
- *      tcpBroker port, mongo database name, filesystem previews path) so
+ *      tcpBroker port, filesystem previews path) so
  *     concurrent mocha worker processes can't collide on shared storage
  *     state.
  *   - spawns a worker-private rqlited bound to the per-worker ports,
@@ -49,14 +49,15 @@ const __dirname = path.dirname(__filename);
 // root.
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 
-// Per-worker port stride. §2D spec is `4001 + id*10`. Worker 0 collides
-// with the host dev rqlited at 4001 by design — in parallel mode the
-// host rqlited must be stopped first (`just clean-test-data-parallel`
-// includes a stop hint).
+// Per-worker port stride. Worker 0 starts at 4011/4012 so the host dev
+// rqlited at 4001/4002 can keep serving sequential test runs unmodified.
+// (Original §2D spec was `4001 + id*10` with worker 0 colliding with the
+// host rqlited; that forced operators to stop the host rqlited before any
+// parallel run. Shifting +10 removes that requirement.)
 const PORT_STRIDE = 10;
 
-const RQLITE_HTTP_BASE = 4001;
-const RQLITE_RAFT_BASE = 4002;
+const RQLITE_HTTP_BASE = 4011;
+const RQLITE_RAFT_BASE = 4012;
 const HTTP_PORT_BASE = 3000;
 const HFS_PORT_BASE = 4000;
 const PREVIEWS_PORT_BASE = 3001;
@@ -71,7 +72,6 @@ interface WorkerOverrides {
   rqliteUrl: string;
   rqliteRaftPort: number;
   rqliteDataDir: string;
-  mongodbDatabase: string;
   httpPort: number;
   hfsPort: number;
   previewsPort: number;
@@ -158,7 +158,6 @@ export function getPerWorkerOverrides (workerId: number = getWorkerId()): Worker
     rqliteUrl: `http://localhost:${RQLITE_HTTP_BASE + stride}`,
     rqliteRaftPort: RQLITE_RAFT_BASE + stride,
     rqliteDataDir: path.join(REPO_ROOT, `var-pryv/rqlite-data-w${workerId}/`),
-    mongodbDatabase: `pryv-node-test-w${workerId}`,
     httpPort: HTTP_PORT_BASE + stride,
     hfsPort: HFS_PORT_BASE + stride,
     previewsPort: PREVIEWS_PORT_BASE + stride,
@@ -175,8 +174,8 @@ export function getPerWorkerOverrides (workerId: number = getWorkerId()): Worker
 
 /**
  * Apply the per-worker config overrides via `config.set`. §2A/§2C
- * (Plan 70 Wave 1) make these reads lazy, so calling `set` before any
- * factory captures the value is enough to propagate.
+ * make these reads lazy, so calling `set` before any factory captures
+ * the value is enough to propagate.
  *
  * Idempotent — safe to call multiple times.
  */
@@ -195,7 +194,7 @@ export async function applyParallelWorkerConfig (): Promise<WorkerOverrides> {
   // each running DIM-spawned child api-servers don't saturate PG's
   // default `max_connections=100`.
   //
-  // Plan 61 14-worker scaling fix: compute adaptively from the parallel
+  // 14-worker scaling: compute pool size adaptively from the parallel
   // job count so a 15-core box (14 workers) doesn't blow past 100 conns.
   // Per worker we estimate: 2 pools (parent + DIM child) × maxPool
   // connections each × 2 processes ≈ 4 × maxPool connections. PG default
@@ -209,7 +208,6 @@ export async function applyParallelWorkerConfig (): Promise<WorkerOverrides> {
   config.set('storages:engines:rqlite:url', o.rqliteUrl);
   config.set('storages:engines:rqlite:raftPort', o.rqliteRaftPort);
   config.set('storages:engines:rqlite:dataDir', o.rqliteDataDir);
-  config.set('storages:engines:mongodb:database', o.mongodbDatabase);
   config.set('http:port', o.httpPort);
   config.set('http:hfsPort', o.hfsPort);
   config.set('http:previewsPort', o.previewsPort);
@@ -229,7 +227,7 @@ export async function applyParallelWorkerConfig (): Promise<WorkerOverrides> {
   // reg-2core fork) inherit parent env by default; boiler's
   // `store.env({separator:'__'})` then picks these up at the
   // subprocess's own init time and aligns it with the per-worker
-  // rqlite/PG/Mongo. The parent's in-memory `config.set` calls above
+  // rqlite/PG/SQLite. The parent's in-memory `config.set` calls above
   // still win for the parent (memory > env in nconf priority).
   applyEnvMirror(o);
 
@@ -263,7 +261,7 @@ export async function applyParallelWorkerConfig (): Promise<WorkerOverrides> {
  *   - `http:port` etc. — `reg-2core` forks with explicit `CORE_PORT` env
  *     and mirroring `http__port` would override that via boiler's env
  *     store, triggering EADDRINUSE.
- *   - PG/Mongo/SQLite/filesystem — no current subprocess opens those
+ *   - PG/SQLite/filesystem — no current subprocess opens those
  *     independent of the parent. Expand selectively if/when needed.
  */
 function applyEnvMirror (o: WorkerOverrides): void {
@@ -271,7 +269,7 @@ function applyEnvMirror (o: WorkerOverrides): void {
   process.env.tcpBroker__port = String(o.tcpBrokerPort);
 }
 
-// Plan 61 Stage 5: apply env mirror at MODULE LOAD so cache module's
+// Apply env mirror at MODULE LOAD so cache module's
 // `loadConfiguration()` at-load `getConfig()` race resolves with the
 // per-worker `tcpBroker:port`. No-op outside parallel mode.
 if (isParallelMode()) {
@@ -388,8 +386,7 @@ export async function stopWorkerRqlited (): Promise<void> {
 
 /**
  * Convenience composite — apply config overrides + spawn rqlited.
- * Used by mochaHooks.beforeAll in `helpers-base.ts` and equivalent
- * places (e.g. the mongodb-engine test hook).
+ * Used by mochaHooks.beforeAll in `helpers-base.ts`.
  */
 export async function setupParallelWorker (): Promise<WorkerOverrides> {
   const o = await applyParallelWorkerConfig();
@@ -400,10 +397,10 @@ export async function setupParallelWorker (): Promise<WorkerOverrides> {
 }
 
 /**
- * Plan 61 Stage 7 narrow fix — create the `keyValue` table on the
- * per-worker rqlited BEFORE any test starts. Otherwise tests that
+ * Create the `keyValue` table on the per-worker rqlited BEFORE any
+ * test starts. Otherwise tests that
  * reach `Platform.deleteUser` / `getUserIndexedField` via fixture
- * cleanup (`mongoFixtures.user(...)` calls `FixtureUser.remove` calls
+ * cleanup (`fixtures.user(...)` calls `FixtureUser.remove` calls
  * `UsersRepository.deleteOne` calls `Platform.deleteUser` calls
  * `DBrqlite.getUserIndexedField`) BEFORE the worker's own `initCore`
  * runs `storages.init()` get an `rqlite SQL error: no such table:

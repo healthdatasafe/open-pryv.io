@@ -15,9 +15,6 @@ const { getLogger } = require('@pryv/boiler');
 const { setAuditAccessId, AuditAccessIds } = require('audit/src/MethodContextUtils.ts');
 const setAdminAuditAccessId = setAuditAccessId(AuditAccessIds.ADMIN_TOKEN);
 
-/**
- * TODO: cleanup this class… it breaks encapsulation (e.g. with event files) and its scope is unclear
- */
 class Deletion {
   logger: any;
 
@@ -105,6 +102,44 @@ class Deletion {
     const deleteUserDirectory = require('storage').userLocalDirectory.deleteUserDirectory;
     await deleteUserDirectory(context.user.id);
     next();
+  }
+
+  // Engine-agnostic audit erasure. The filesystem wipe in deleteAuditData
+  // covers SQLite as a side-effect (per-user .sqlite file lives in the user
+  // dir) but leaves PG audit_events rows behind. This step routes through
+  // the AuditStorage interface so every engine converges on the same
+  // end-state. Runs BEFORE deleteAuditData so the SQLite path closes the DB
+  // file cleanly before the directory wipe.
+  //
+  // Behaviour gated by `audit:onUserDelete` operator setting.
+  //   erase (default) — wipe via auditStorage.deleteUser.
+  //   keep            — skip the wipe (HIPAA / MDR long-retention regimes).
+  //   pseudonymise    — refused at boot by config-validation (depends on the
+  //                     not-yet-shipped ALIASES primitive). If somehow seen here
+  //                     (override during runtime), fall back to 'erase' + warn-log.
+  async deleteAuditDataStorage (context: any, params: any, result: any, next: any) {
+    try {
+      const mode: string = this.config.get('audit:onUserDelete') || 'erase';
+      if (mode === 'keep') {
+        this.logger.info(
+          `audit:onUserDelete=keep — skipping audit erasure for user ${context.user.id} (operator policy)`
+        );
+        return next();
+      }
+      if (mode === 'pseudonymise') {
+        this.logger.warn(
+          `audit:onUserDelete=pseudonymise requested for user ${context.user.id} but ALIASES primitive (open-pryv.io#38) is not yet available — falling back to 'erase'. config-validation should have blocked this at boot.`
+        );
+      }
+      const auditStorage = require('storages').auditStorage;
+      if (auditStorage != null) {
+        await auditStorage.deleteUser(context.user.id);
+      }
+      next();
+    } catch (err: any) {
+      this.logger.error(err, err);
+      return next(errors.unexpectedError(err));
+    }
   }
 
   async deleteUser (context: any, params: any, result: any, next: any) {

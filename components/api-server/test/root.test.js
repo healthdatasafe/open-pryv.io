@@ -36,13 +36,13 @@ describe('[ROOT] root', function () {
     isAuditActive = config.get('audit:active');
   });
 
-  let mongoFixtures;
+  let fixtures;
   before(async function () {
-    mongoFixtures = databaseFixture(await produceStorageConnection());
-    await mongoFixtures.context.cleanEverything();
+    fixtures = databaseFixture(await produceStorageConnection());
+    await fixtures.context.cleanEverything();
   });
   after(async () => {
-    await mongoFixtures.context.cleanEverything();
+    await fixtures.context.cleanEverything();
   });
 
   let username, personalAccess, personalAccessToken,
@@ -65,10 +65,10 @@ describe('[ROOT] root', function () {
     username2 = '00000';
   });
 
-  // Plan 61 Wave 7: migrated from legacy SpawnContext/ProcessProxy to
-  // DynamicInstanceManager. ProcessProxy's `server.request()` and
-  // `server.baseUrl` were swept to `helpers.request(server.url)` and
-  // `server.url` respectively via bulk replace_all.
+  // Uses DynamicInstanceManager (modern Pattern-A spawner). Callsites
+  // use `helpers.request(server.url)` and `server.url` (property)
+  // rather than the legacy ProcessProxy `server.request()` and
+  // `server.baseUrl`.
   const server = helpers.dependencies.instanceManager;
   before(async () => {
     await server.ensureStartedAsync(helpers.dependencies.settings);
@@ -76,7 +76,7 @@ describe('[ROOT] root', function () {
 
   before(async function () {
     // delete all database before start
-    user = await mongoFixtures.user(username, {});
+    user = await fixtures.user(username, {});
     personalAccess = await user.access({
       type: 'personal', token: personalAccessToken
     });
@@ -110,7 +110,7 @@ describe('[ROOT] root', function () {
     await user.session(personalAccessToken);
     user = user.attrs;
 
-    user2 = await mongoFixtures.user(username2, {
+    user2 = await fixtures.user(username2, {
       id: 'u_2',
       password: 't3st-Numb3r',
       email: '00001@test.com',

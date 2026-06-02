@@ -36,18 +36,18 @@ describe('[AC01] accesses', () => {
       accessToken = cuid();
     });
 
-    let mongoFixtures;
+    let fixtures;
     before(async () => {
-      mongoFixtures = getNewFixture();
+      fixtures = getNewFixture();
     });
     after(async () => {
-      await mongoFixtures.context.cleanEverything();
+      await fixtures.context.cleanEverything();
     });
 
     describe('[AC03] when given a few existing accesses', () => {
       const deletedTimestamp = timestamp.now('-1h');
       before(async () => {
-        const user = await mongoFixtures.user(userId);
+        const user = await fixtures.user(userId);
         await user.stream({ id: streamId }, () => { });
         await user.access({
           type: 'app',
@@ -173,8 +173,8 @@ describe('[AC01] accesses', () => {
             .get(`/${userId}/accesses`)
             .set('Authorization', accessToken);
           activeAccess = res.body.accesses.find((a) => a.token === activeToken);
-          // Plan 66: accesses.update is back; sending the immutable
-          // `deleted` field now lands on schema validation, which has an
+          // Sending the immutable `deleted` field on accesses.update
+          // lands on schema validation, which has an
           // `additionalProperties: false` whitelist of mutable fields
           // (name, deviceName, permissions, expireAfter, expires,
           // clientData). The route auto-wraps the body into `update`, so
@@ -201,10 +201,10 @@ describe('[AC01] accesses', () => {
       username = cuid();
       streamId = charlatan.Lorem.word();
     });
-    let mongoFixtures;
+    let fixtures;
     before(async () => {
-      mongoFixtures = getNewFixture();
-      const user = await mongoFixtures.user(username);
+      fixtures = getNewFixture();
+      const user = await fixtures.user(username);
       await user.stream({ id: streamId }, () => { });
       access = await user.access({
         type: 'app',
@@ -267,7 +267,7 @@ describe('[AC01] accesses', () => {
       expiredSharedAccess = expiredSharedAccess.attrs;
     });
     after(async () => {
-      await mongoFixtures.clean();
+      await fixtures.clean();
     });
 
     describe('[AC10] when deleting an app access that created shared accesses', () => {
@@ -313,6 +313,88 @@ describe('[AC01] accesses', () => {
     });
   });
 
+  describe('[WCAD] webhook cascade on access delete', () => {
+    let username, streamId, appAccess, sharedAccess, sharedSiblingAccess;
+    let appWebhook, sharedWebhook, siblingWebhook;
+    let fixtures;
+    let webhooksStorage;
+
+    before(async () => {
+      webhooksStorage = helpers.dependencies.storage.user.webhooks;
+    });
+
+    before(async () => {
+      username = cuid();
+      streamId = charlatan.Lorem.word();
+      fixtures = getNewFixture();
+      const user = await fixtures.user(username);
+      await user.stream({ id: streamId }, () => {});
+
+      appAccess = (await user.access({
+        type: 'app',
+        name: charlatan.Lorem.word() + '-app',
+        permissions: [{ streamId, level: 'read' }]
+      })).attrs;
+
+      sharedAccess = (await user.access({
+        type: 'shared',
+        name: charlatan.Lorem.word() + '-shared',
+        permissions: [{ streamId, level: 'read' }],
+        createdBy: appAccess.id
+      })).attrs;
+
+      // Unrelated shared access — its webhook must survive.
+      sharedSiblingAccess = (await user.access({
+        type: 'shared',
+        name: charlatan.Lorem.word() + '-sibling',
+        permissions: [{ streamId, level: 'read' }]
+      })).attrs;
+
+      appWebhook = (await user.webhook({
+        url: `https://${charlatan.Internet.domainName()}/app-notify`
+      }, appAccess.id)).attrs;
+
+      sharedWebhook = (await user.webhook({
+        url: `https://${charlatan.Internet.domainName()}/shared-notify`
+      }, sharedAccess.id)).attrs;
+
+      siblingWebhook = (await user.webhook({
+        url: `https://${charlatan.Internet.domainName()}/sibling-notify`
+      }, sharedSiblingAccess.id)).attrs;
+    });
+
+    after(async () => {
+      await fixtures.clean();
+    });
+
+    describe('[WCAD-A] when deleting an app access', () => {
+      before(async () => {
+        await coreRequest
+          .del(`/${username}/accesses/${appAccess.id}`)
+          .set('Authorization', appAccess.token);
+      });
+
+      it('[WCAD1] deletes the webhook attached to the deleted access', async () => {
+        const findOneAsync = promisify((u, q, opts, cb) => webhooksStorage.findOne(u, q, opts, cb));
+        const found = await findOneAsync({ id: username }, { id: appWebhook.id }, {});
+        assert.strictEqual(found, null);
+      });
+
+      it('[WCAD2] cascades to webhooks on descendant shared accesses', async () => {
+        const findOneAsync = promisify((u, q, opts, cb) => webhooksStorage.findOne(u, q, opts, cb));
+        const found = await findOneAsync({ id: username }, { id: sharedWebhook.id }, {});
+        assert.strictEqual(found, null);
+      });
+
+      it('[WCAD3] does NOT touch webhooks on unrelated accesses', async () => {
+        const findOneAsync = promisify((u, q, opts, cb) => webhooksStorage.findOne(u, q, opts, cb));
+        const found = await findOneAsync({ id: username }, { id: siblingWebhook.id }, {});
+        assert.ok(found != null);
+        assert.strictEqual(found.id, siblingWebhook.id);
+      });
+    });
+  });
+
   describe('[AC11] access expiry', () => {
     // Uses dynamic fixtures:
     // Set up a few ids that we'll use for testing. NOTE that these ids will
@@ -329,10 +411,10 @@ describe('[AC01] accesses', () => {
       hasExpiryToken = cuid();
     });
     describe('[AC12] when given a few existing accesses', () => {
-      let mongoFixtures;
+      let fixtures;
       before(async () => {
-        mongoFixtures = getNewFixture();
-        const user = await mongoFixtures.user(userId);
+        fixtures = getNewFixture();
+        const user = await fixtures.user(userId);
         await user.stream({ id: streamId }, () => { });
         // A token that expired one day ago
         await user.access({
@@ -651,10 +733,10 @@ describe('[AC01] accesses', () => {
       ];
     });
     describe('[AC28] when given a few existing accesses', () => {
-      let mongoFixtures;
+      let fixtures;
       before(async () => {
-        mongoFixtures = getNewFixture();
-        const user = await mongoFixtures.user(userId);
+        fixtures = getNewFixture();
+        const user = await fixtures.user(userId);
         await user.stream({ id: streamId }, () => { });
         await user.access({ token: accessToken, type: 'personal' });
         await user.access(existingAccess);
@@ -807,14 +889,14 @@ describe('[AC01] accesses', () => {
   });
 
   describe('[AC38] access-info', () => {
-    let mongoFixtures;
+    let fixtures;
     const userId = cuid();
     let user;
     const appToken = cuid();
 
     before(async () => {
-      mongoFixtures = getNewFixture();
-      user = await mongoFixtures.user(userId);
+      fixtures = getNewFixture();
+      user = await fixtures.user(userId);
       await user.access({
         type: 'app',
         token: appToken,
@@ -839,12 +921,6 @@ describe('[AC01] accesses', () => {
       assert.ok(body.user);
       assert.ok(body.user.username);
       assert.strictEqual(body.user.username, userId);
-    });
-
-    // NOTE: This test requires server restart with custom settings - skipped in Pattern C
-    describe.skip('[APRA] When password rules are enabled', async () => {
-      // This test requires spawning server with different settings (settingsOverride)
-      // which is not supported in Pattern C. Keep using Pattern B if this test is needed.
     });
   });
 });

@@ -16,6 +16,7 @@ function pick (obj: any, keys: any) {
 const { createId: cuid } = require('@paralleldrive/cuid2');
 const timestamp = require('unix-timestamp');
 const { pubsub } = require('messages');
+const cache = require('cache').default;
 
 class Webhook {
   id;
@@ -105,6 +106,20 @@ class Webhook {
    */
   async send (message: any, isRescheduled?: any) {
     if (this.state === 'inactive') { return; }
+    // Fire-time access-validity check: self-heal orphan webhooks whose
+    // access was revoked, including those created before the cascade
+    // delete logic shipped.
+    if (this.repository != null && typeof this.repository.accessExists === 'function') {
+      const cacheHit = cache.getAccessLogicForId(this.user.id, this.accessId);
+      if (cacheHit == null) {
+        const stillValid = await this.repository.accessExists(this.user, this.accessId);
+        if (!stillValid) {
+          this.state = 'inactive';
+          await makeUpdate(['state'], this);
+          return;
+        }
+      }
+    }
     if (isRescheduled != null && isRescheduled === true) {
       this.timeout = null;
     }

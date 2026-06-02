@@ -26,21 +26,19 @@ const LRU_CACHE_MAX_AGE_MS = 1000 * 60 * 5; // 5 mins
  * Caches data about a series first by `accessToken`, then by `eventId`.
  * */
 class MetadataCache {
-  loader: any;
-  /**
-   * Stores:
-   *  - username/eventId -> [accessTokens]
-   *  - accessToken -> username/eventID/accessToken
-   *  - username/eventId/accessToken -> SeriesMetadataImpl (metadata_cache.js)
-   */
-  cache: any;
+  loader: MetadataLoader;
+  // Stores:
+  //  - username/eventId -> [accessTokens]
+  //  - accessToken -> [username/eventId/accessToken, ...]
+  //  - username/eventId/accessToken -> SeriesMetadataImpl
+  cache: InstanceType<typeof LRU>;
 
-  series: any;
+  series: any; // SeriesConnection — not yet typed.
 
   mall: any;
 
   config: any;
-  constructor (series: any, metadataLoader: any, config: any) {
+  constructor (series: any, metadataLoader: MetadataLoader, config: any) {
     this.loader = metadataLoader;
     this.series = series;
     this.config = config;
@@ -58,17 +56,17 @@ class MetadataCache {
   }
 
   // transport messages
-  dropSeries (usernameEvent: any) {
+  dropSeries (usernameEvent: UsernameEvent) {
     return this.series.connection.dropMeasurement('event.' + usernameEvent.event.id, 'user.' + usernameEvent.username);
   }
 
-  invalidateEvent (usernameEvent: any) {
+  invalidateEvent (usernameEvent: UsernameEvent) {
     const cache = this.cache;
     const eventKey = usernameEvent.username + '/' + usernameEvent.event.id;
-    const cachedTokenListForEvent = cache.get(eventKey);
+    const cachedTokenListForEvent = cache.get(eventKey) as string[] | undefined;
     if (cachedTokenListForEvent != null) {
       // what does this return
-      cachedTokenListForEvent.forEach((token: any) => {
+      cachedTokenListForEvent.forEach((token: string) => {
         cache.delete(eventKey + '/' + token);
       });
     }
@@ -80,14 +78,14 @@ class MetadataCache {
   }
 
   // cache logic
-  async forSeries (userName: any, eventId: any, accessToken: any) {
+  async forSeries (userName: string, eventId: string, accessToken: string) {
     const cache = this.cache;
     const key = [userName, eventId, accessToken].join('/');
     // to make sure we update the tokenList "recently used info" cache we also get eventKey
     const eventKey = [userName, eventId].join('/');
-    const cachedTokenListForEvent = cache.get(eventKey);
+    const cachedTokenListForEvent = cache.get(eventKey) as string[] | undefined;
     // also keep a list of used Token to invalidate them
-    const cachedEventListForTokens = cache.get(accessToken);
+    const cachedEventListForTokens = cache.get(accessToken) as string[] | undefined;
     const cachedValue = cache.get(key);
     if (cachedValue != null) {
       logger.debug(`Using cached credentials for ${userName} / ${eventId}.`);
@@ -117,22 +115,23 @@ class MetadataLoader {
 
   mall: any;
 
-  async init (mall: any, logger: any) {
+  async init (mall: unknown, _logger: unknown) {
     this.mall = mall;
     this.storage = await storage.getStorageLayer();
   }
 
-  forSeries (userName: any, eventId: any, accessToken: any) {
+  forSeries (userName: string, eventId: string, accessToken: string) {
     const storage = this.storage;
     const mall = this.mall;
     // Retrieve Access (including accessLogic)
     const contextSource = {
       name: 'hf',
+      // TODO(B-2026-05-27-9, 2026-05-27): pass real client IP from express req — currently emits literal 'TODO' into audit context
       ip: 'TODO'
     };
     const customAuthStep = null;
     const methodContext = new MethodContext(contextSource, userName, accessToken, customAuthStep);
-    return fromCallback(async (returnValueCallback: any) => {
+    return fromCallback(async (returnValueCallback: (err: unknown, value?: unknown) => void) => {
       try {
         await methodContext.init();
         await methodContext.retrieveExpandedAccess(storage);
@@ -147,15 +146,15 @@ class MetadataLoader {
         const serieMetadata = new SeriesMetadataImpl(access, user, event);
         serieMetadata.init().then(() => {
           returnValueCallback(null, serieMetadata);
-        }, (error: any) => {
+        }, (error: unknown) => {
           returnValueCallback(error, serieMetadata);
         });
       } catch (err) {
         returnValueCallback(mapErrors(err));
       }
     });
-    function mapErrors (err: any) {
-      if (!(err instanceof Error)) { return new Error(err); }
+    function mapErrors (err: unknown): Error {
+      if (!(err instanceof Error)) { return new Error(String(err)); }
       // else
       return err;
     }
@@ -168,24 +167,24 @@ class MetadataLoader {
  *  only things that we subsequently need for our operations.
  */
 class SeriesMetadataImpl {
-  permissions: any;
+  permissions!: { write: boolean; read: boolean };
 
-  userName: any;
+  userName: string;
 
-  eventId: any;
+  eventId: string;
 
-  eventType: any;
+  eventType: string;
 
-  time: any;
+  time: number;
 
-  trashed: any;
+  trashed: boolean;
 
-  deleted: any;
+  deleted: number | null;
 
-  _access: any;
+  _access: AccessModel;
 
-  _event: any;
-  constructor (access: any, user: any, event: any) {
+  _event: EventModel;
+  constructor (access: AccessModel, user: UserModel, event: EventModel) {
     this._access = access;
     this._event = event;
     this.userName = user.username;
@@ -217,20 +216,19 @@ class SeriesMetadataImpl {
   }
 
   // Return the InfluxDB row type for the given event.
-  produceRowType (repo: any) {
+  produceRowType (repo: { lookup (type: string): any }) {
     const type = repo.lookup(this.eventType);
 
-    // TODO review this now that flow is gone:
-    // NOTE The instanceof check here serves to make flow-type happy about the
-    //  value we'll return from this function. If duck-typing via 'isSeries' is
-    //  ever needed, you'll need to find a different way of providing the same
-    //  static guarantee (think interfaces...).
+    // NOTE: the instanceof check here serves to make the type system happy
+    // about the value we return. If duck-typing via 'isSeries' is ever
+    // needed, you'll need a different way of providing the same static
+    // guarantee (think interfaces...).
     if (!type.isSeries() || !(type instanceof SeriesRowType)) { throw errors.invalidOperation("High Frequency data can only be stored in events whose type starts with 'series:'."); }
     type.setSeriesMeta(this);
     return type;
   }
 }
-async function definePermissions (access: any, event: any) {
+async function definePermissions (access: AccessModel, event: EventModel) {
   const streamIds = event.streamIds;
   const permissions = {
     write: false,
@@ -242,7 +240,7 @@ async function definePermissions (access: any, event: any) {
     if (await access.canGetEventsOnStream(streamIds[i], 'local')) { permissions.read = true; }
   }
   return permissions;
-  function readAndWriteTrue (permissions: any) {
+  function readAndWriteTrue (permissions: { write: boolean; read: boolean }) {
     return permissions.write === true && permissions.read === true;
   }
 }
@@ -255,16 +253,16 @@ type UsernameEvent = {
   };
 };
 type AccessModel = {
-  canCreateEventsOnStream(streamId: string): boolean;
-  canGetEventsOnStream(streamId: string, storeId: string): boolean;
+  canCreateEventsOnStream(streamId: string): Promise<boolean>;
+  canGetEventsOnStream(streamId: string, storeId: string): Promise<boolean>;
 };
 type EventModel = {
   id: string;
-  streamIds: string;
+  streamIds: string[];
   type: string;
   time: number;
   trashed: boolean;
-  deleted: number;
+  deleted: number | null;
 };
 type UserModel = {
   id: string;
