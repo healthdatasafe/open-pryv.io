@@ -43,10 +43,25 @@ RUN apt-get -y --purge autoremove python3 build-essential && \
 
 ENV NODE_ENV=production
 
+# Self-referential image tag — baked at build time, read at runtime by the
+# install wizard so the generated run-pryv.sh / check-config.sh launchers
+# default their PRYV_IMAGE to the same tag the container was pulled from.
+# CI passes `--build-arg IMAGE_TAG=${{ github.ref_name }}` on tag pushes;
+# local `docker build .` falls back to `dev` (a tag that doesn't exist on
+# Docker Hub, so a wizard run from a local build surfaces the
+# misconfiguration cleanly when the operator runs ./run-pryv.sh and docker
+# can't pull it).
+ARG IMAGE_TAG=dev
+ENV PRYV_IMAGE_TAG=${IMAGE_TAG}
+
 # 3000: API. 4000: HFS (multi-worker). 3001: previews. 443: native HTTPS
 # (when http.ssl.* set). 80: ACME HTTP-01 (DNS-01 is the default). 53/udp:
 # embedded DNS (when dns.enabled). EXPOSE is informational only — Dokku and
 # similar PaaS use it to know which container ports may be published.
 EXPOSE 80 443 3000 3001 4000 53/udp
 
-CMD ["node", "bin/master.js"]
+# Entry-point dispatcher: no args → normal master.js boot;
+# `init <path>` → interactive config wizard; `check-config <path>` → validate
+# existing config; anything else → exec passthrough.
+ENTRYPOINT ["./scripts/docker-entrypoint.sh"]
+CMD []

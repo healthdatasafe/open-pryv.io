@@ -26,6 +26,55 @@ YAML config files, loaded in order (last wins):
 3. `--config /path/to/override.yml`
 4. `--key:path=value` on command line
 
+### Quickest path: `docker run … init` (interactive wizard)
+
+For a fresh single-core install, the docker image ships an interactive wizard that produces a complete `pryv-config.yml` from prompts (DNS topology, storage engine, secrets, TLS strategy, app-web-auth3 URL, …) and validates the host environment before writing.
+
+Pick (or create) the host directory where you want your install to live, `cd` into it, and run:
+
+```bash
+mkdir -p /opt/pryv && cd /opt/pryv
+docker run -it --rm \
+  -v "$(pwd):/app/pryv" \
+  pryvio/open-pryv.io:2.0.0-rc.1 init
+```
+
+After the wizard finishes, `$PWD` contains `pryv-config.yml` + `run-pryv.sh` + a `data/` folder for user data. Start the server with `./run-pryv.sh`.
+
+The mount **target** (right of the `:`) must not be `/app/config` — that directory is owned by the image and holds the bundled config plugins (`systemStreams`, `paths-config`, …); a directory mount over it would mask them and master.js would refuse to boot. `/app/pryv` is the conventional non-conflicting choice and is hardcoded in the wizard; no path argument is needed.
+
+The wizard:
+- Auto-discovers the host path from `/proc/self/mountinfo` so the generated `run-pryv.sh` carries the operator's real on-disk path. No env-var override needed in the common case.
+- Prompts for ~15 deployment-specific choices; defaults are pre-filled and accepted with enter.
+- Auto-derives the user-data folder to `<pwd>/data` (sibling to the config). No prompt.
+- Pins `letsEncrypt.tlsDir: <pwd>/data/tls` so the ACME-issued cert lives on the same operator-mounted volume as the workers' `http.ssl.{certFile,keyFile}` paths — survives container restarts cleanly.
+- Generates random secrets (`auth.adminAccessKey`, `auth.filesReadTokenSecret`, `letsEncrypt.atRestKey`) — *back these up before discarding the container output, losing them locks you out of audit + cert decryption*.
+- For `dnsLess: false` (multi-core / subdomain-per-user), prints a host pre-flight block with the commands to free UDP/53 on the host (disable `systemd-resolved` on Ubuntu 24+ / Fedora / modern Debian).
+- Refuses to overwrite an existing `pryv-config.yml` — move the file aside to re-run.
+- Writes a sibling `run-pryv.sh` launcher that pins the image, self-locates via `cd "$(dirname "$0")" && pwd`, mounts config + data, and publishes the right ports for the configuration you chose:
+
+```bash
+# Inside the install dir created above:
+./run-pryv.sh
+# Override the host data dir if you want it elsewhere:
+PRYV_DATA_DIR=/srv/pryv/data ./run-pryv.sh
+```
+
+If you prefer hand-crafting the YAML (or already have one), skip to **Minimal production config** below. The wizard's output matches that shape exactly.
+
+### Validating an existing config
+
+`check-config` runs the same structural checks the wizard runs (REQUIRED service fields, REQUIRED_WHEN auth secrets, dnsLess vs dns.active, PG creds when applicable, etc.) against a config you already have, without booting. Useful for catching half-configured cases (e.g. `access.defaultAuthUrl` missing — would silently break SDK sign-in) before they hit production.
+
+```bash
+docker run --rm \
+  -v "$(pwd):/app/pryv" \
+  pryvio/open-pryv.io:2.0.0-rc.1 \
+  check-config /app/pryv/pryv-config.yml
+```
+
+Exit 0 = all required-at-boot checks passed. Exit 1 = at least one problem (printed). Warnings (e.g. missing `access.defaultAuthUrl`) print but don't fail.
+
 ### Minimal production config
 
 ```yaml
@@ -320,6 +369,8 @@ The Dockerfile declares `VOLUME ["/app/var-pryv/rqlite-data"]` so this is the de
 
 ### Docker (plain)
 
+If you generated the config + launcher via the wizard (see **Configuration → Quickest path** above), just run the sibling `run-pryv.sh`. Otherwise, the manual form:
+
 ```bash
 docker run \
   -v /host/pryv/data:/app/data \
@@ -328,8 +379,10 @@ docker run \
   -e NODE_ENV=production \
   -e PRYV_DATADIR=/app/data \
   -p 3000:3000 \
-  pryvio/open-pryv.io
+  pryvio/open-pryv.io:2.0.0-rc.1
 ```
+
+The default entrypoint dispatches on the first arg: no args boots `bin/master.js` (the normal server); `init <path>` runs the wizard; `check-config <path>` runs the validator; anything else passes through (e.g. `docker run pryvio/open-pryv.io node --version`).
 
 When running with `letsEncrypt.enabled: true` (master serves HTTPS itself
 instead of being fronted by a reverse proxy), publish 443 (HTTP-01 also
@@ -340,7 +393,7 @@ docker run \
   ... \
   -p 443:443/tcp \
   -p 80:80/tcp \
-  pryvio/open-pryv.io
+  pryvio/open-pryv.io:2.0.0-rc.1
 ```
 
 The Dockerfile already declares `EXPOSE 80 443 3000 3001 4000 53/udp`; the
@@ -453,6 +506,30 @@ node bin/migrate.js up --target 3      # stop per-engine at version 3
 
 Set `migrations.autoRunOnStart: false` in config to disable auto-run at startup and rely on the CLI only.
 
+## First-boot DNS chain (dns-active mode)
+
+Before a dns-active deployment can issue a wildcard cert via Let's Encrypt DNS-01, the embedded DNS server must answer authoritatively for the zone: SOA + NS for the apex (`<domain>`), and an A record for `core.<domain>` (the canonical API hostname). Public recursors discard delegated answers when no SOA is present, so `acme-client`'s DNS-01 preflight errors with `No TXT records found for name: _acme-challenge.<domain>` before the LE round-trip even starts.
+
+`bin/master.js` seeds this chain on every boot when `dns.active: true` + `dns.domain` is set:
+
+1. Reads `dns.publicIp` from the YAML — the wizard prompts for it (auto-detected via `checkip.amazonaws.com`); set it by hand for hand-written configs.
+2. Merges a default SOA (primary `core.<domain>.`, admin derived from `letsEncrypt.email` or `admin@<domain>`, RFC 1912 timing) into `dns.records.root.soa` **only if empty**.
+3. Merges a default NS (`core.<domain>.`) into `dns.records.root.ns` **only if empty**.
+4. Writes `A core.<domain> -> publicIp` to PlatformDB via `setDnsRecord('core', ...)` **only if no record under that subdomain exists**.
+
+Operator-edited records always win — anything you set under `dns.records.root.*` in YAML, or load via `bin/dns-records.js load` (see below), is left untouched.
+
+You still need the **parent zone NS delegation** in your registrar / parent DNS provider (Infomaniak, Route 53, Cloudflare, …):
+
+```
+<domain>.    IN NS  core.<domain>.    ; or your designated NS hostname
+core.<domain>. IN A  <publicIp>        ; glue record at the parent
+```
+
+The glue record at the parent is what lets recursors find `core.<domain>` before they've ever talked to your authoritative server. Without it, NS chains break on the first lookup.
+
+If `dns.publicIp` is unset on boot, master logs `FATAL: dns.publicIp is unset …` and **skips** the ACME orchestrator start (which would otherwise burn the LE rate limit on a guaranteed-fail issuance). Set the field and restart.
+
 ## Managing persistent DNS records
 
 When the embedded DNS server is active (`dns.active: true`), runtime DNS entries (ACME challenges, admin-managed subdomains) are persisted in PlatformDB so they survive restart and replicate across cores. Two ways to manage them:
@@ -499,6 +576,8 @@ records:
 ```
 
 Static entries declared in `dns.staticEntries` config are authoritative and cannot be shadowed by PlatformDB entries; attempts to write a matching subdomain are rejected.
+
+The first-boot bootstrap (above) also writes through `bin/dns-records.js`-equivalent paths (`setDnsRecord('core', ...)` + an in-memory mutation of `dns.records.root` for SOA/NS). It only fills records that are missing — any subdomain you `load` via this CLI is left in place across restarts. To take ownership of the `core` A record (e.g. to point it at multiple IPs), `node bin/dns-records.js load core-override.yaml` once; the bootstrap will see it on the next boot and not overwrite.
 
 ## Cluster security
 

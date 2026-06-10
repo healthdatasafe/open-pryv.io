@@ -38,18 +38,55 @@ const DEFAULT_PLATFORM_REFRESH_INTERVAL_MS = 30000;
  */
 const RESERVED_SERVICE_NAMES = ['reg', 'access', 'mfa'];
 
+type BoilerConfig = { get (key: string): unknown };
+type Logger = {
+  info (msg: string): void;
+  warn (msg: string): void;
+  error (msg: string): void;
+};
+
+type DnsAnswer = Record<string, unknown>;
+type DnsQuestion = { name: string; type: number };
+type DnsRequest = { questions: DnsQuestion[] };
+type DnsResponse = { answers: DnsAnswer[]; header: { rcode: number; [k: string]: unknown }; [k: string]: unknown };
+type DnsSendFn = (resp: DnsResponse) => void;
+type Dns2EventHandler = (...args: unknown[]) => void;
+interface Dns2Server {
+  on: (event: string, handler: Dns2EventHandler) => void;
+  listen: (opts: { udp: { port: number; address: string; type: string } } | number, ip?: string) => Promise<void>;
+  close: () => Promise<void> | void;
+  addresses: () => { udp?: { address: string; port: number }; tcp?: { address: string; port: number } };
+  _udp6?: Dns2Server;
+}
+
+type DnsRecordEntry = {
+  a?: string | string[];
+  aaaa?: string | string[];
+  cname?: string;
+  txt?: string | string[];
+};
+type CoreInfo = { ip?: string; ipv6?: string; cname?: string; [k: string]: unknown };
+type PlatformLike = {
+  getAllDnsRecords?: () => Promise<Array<{ subdomain: string; records: DnsRecordEntry }>>;
+  setDnsRecord?: (subdomain: string, records: DnsRecordEntry) => Promise<unknown>;
+  deleteDnsRecord?: (subdomain: string) => Promise<unknown>;
+  getAllCoreInfos: () => Promise<CoreInfo[]>;
+  getCoreInfo: (coreId: string) => Promise<CoreInfo | null>;
+  getUserCore: (username: string) => Promise<string | null>;
+};
+
 class DnsServer {
-  #config;
-  #platform;
-  #logger;
-  #server: any;
-  #domain;
-  #ttl;
-  #rootRecords;
-  #staticEntries: any;       // working map: config entries + runtime entries
-  #configKeys;          // Set of subdomain keys that came from YAML config (immutable)
-  #platformRefreshTimer: any;
-  #platformRefreshIntervalMs;
+  #config: BoilerConfig;
+  #platform: PlatformLike;
+  #logger: Logger;
+  #server!: Dns2Server;
+  #domain: string;
+  #ttl: number;
+  #rootRecords: Record<string, unknown>;
+  #staticEntries: Record<string, DnsRecordEntry>;       // working map: config entries + runtime entries
+  #configKeys: Set<string>;          // Set of subdomain keys that came from YAML config (immutable)
+  #platformRefreshTimer: NodeJS.Timeout | null = null;
+  #platformRefreshIntervalMs: number;
 
   /**
    * @param opts.config - @pryv/boiler config
@@ -57,15 +94,15 @@ class DnsServer {
    * @param opts.logger - logger with .info/.warn/.error
    * @param [opts.platformRefreshIntervalMs] - override refresh interval (tests)
    */
-  constructor ({ config, platform, logger, platformRefreshIntervalMs }: any) {
+  constructor ({ config, platform, logger, platformRefreshIntervalMs }: { config: BoilerConfig; platform: PlatformLike; logger: Logger; platformRefreshIntervalMs?: number }) {
     this.#config = config;
     this.#platform = platform;
     this.#logger = logger;
-    this.#domain = config.get('dns:domain');
-    this.#ttl = config.get('dns:defaultTTL') || 300;
-    this.#rootRecords = config.get('dns:records:root') || {};
+    this.#domain = config.get('dns:domain') as string;
+    this.#ttl = (config.get('dns:defaultTTL') as number) || 300;
+    this.#rootRecords = (config.get('dns:records:root') as Record<string, unknown>) || {};
     // Deep-copy static entries from config so runtime updates don't mutate config
-    const configEntries = config.get('dns:staticEntries') || {};
+    const configEntries = (config.get('dns:staticEntries') as Record<string, DnsRecordEntry>) || {};
     this.#staticEntries = Object.assign({}, configEntries);
     this.#configKeys = new Set(Object.keys(configEntries));
     this.#platformRefreshIntervalMs = platformRefreshIntervalMs ?? DEFAULT_PLATFORM_REFRESH_INTERVAL_MS;
@@ -77,19 +114,21 @@ class DnsServer {
    * @param opts.ip - bind address (e.g. '0.0.0.0')
    * @param opts.ip6 - IPv6 bind address (null = disabled)
    */
-  async start ({ port, ip, ip6 }: any) {
+  async start ({ port, ip, ip6 }: { port: number; ip: string; ip6?: string | null }) {
     this.#server = dns2.createServer({
       udp: true,
-      handle: (request: any, send: any, rinfo: any) => {
+      handle: (request: DnsRequest, send: DnsSendFn, rinfo: unknown) => {
         this.#handleRequest(request, send, rinfo);
       }
     });
 
-    this.#server.on('requestError', (err: any) => {
+    this.#server.on('requestError', (...args: unknown[]) => {
+      const err = args[0] as Error;
       this.#logger.warn('DNS request parse error: ' + err.message);
     });
 
-    this.#server.on('error', (err: any) => {
+    this.#server.on('error', (...args: unknown[]) => {
+      const err = args[0] as Error;
       this.#logger.error('DNS server error: ' + err.message);
     });
 
@@ -103,10 +142,11 @@ class DnsServer {
     // If IPv6 is configured, start a second UDP6 server
     if (ip6) {
       this.#server._udp6 = dns2.createUDPServer({ type: 'udp6' });
-      this.#server._udp6.on('request', (request: any, send: any, rinfo: any) => {
+      this.#server._udp6!.on('request', (...args: unknown[]) => {
+        const [request, send, rinfo] = args as [DnsRequest, DnsSendFn, unknown];
         this.#handleRequest(request, send, rinfo);
       });
-      await this.#server._udp6.listen(port, ip6);
+      await this.#server._udp6!.listen(port, ip6);
       this.#logger.info(`DNS server listening on [${ip6}]:${port} (IPv6)`);
     }
 
@@ -116,12 +156,12 @@ class DnsServer {
     await this.refreshFromPlatform();
     if (this.#platformRefreshIntervalMs > 0) {
       this.#platformRefreshTimer = setInterval(() => {
-        this.refreshFromPlatform().catch((err) => {
+        this.refreshFromPlatform().catch((err: Error) => {
           this.#logger.warn('DNS platform refresh failed: ' + err.message);
         });
       }, this.#platformRefreshIntervalMs);
       // Don't block process exit on this timer
-      if (typeof this.#platformRefreshTimer.unref === 'function') {
+      if (this.#platformRefreshTimer && typeof this.#platformRefreshTimer.unref === 'function') {
         this.#platformRefreshTimer.unref();
       }
     }
@@ -139,8 +179,8 @@ class DnsServer {
     if (!this.#platform || typeof this.#platform.getAllDnsRecords !== 'function') {
       return;
     }
-    const persisted = await this.#platform.getAllDnsRecords();
-    const seenSubdomains = new Set();
+    const persisted = await this.#platform.getAllDnsRecords!();
+    const seenSubdomains = new Set<string>();
     for (const { subdomain, records } of persisted) {
       if (this.#configKeys.has(subdomain)) {
         // Config wins — log drift once per refresh if different
@@ -195,7 +235,7 @@ class DnsServer {
    * @param subdomain - e.g. '_acme-challenge'
    * @param records - e.g. { txt: ['validation-token'] } or { cname: 'target.example.com' }
    */
-  async updateStaticEntry (subdomain: any, records: any) {
+  async updateStaticEntry (subdomain: string, records: DnsRecordEntry) {
     if (this.#configKeys.has(subdomain)) {
       const msg = `DNS runtime update rejected: '${subdomain}' is a config-static entry and cannot be overwritten at runtime`;
       this.#logger.warn(msg);
@@ -211,7 +251,7 @@ class DnsServer {
   /**
    * Delete a runtime DNS entry. No-op for config-sourced static entries.
    */
-  async deleteStaticEntry (subdomain: any) {
+  async deleteStaticEntry (subdomain: string) {
     if (this.#configKeys.has(subdomain)) {
       const msg = `DNS runtime delete rejected: '${subdomain}' is a config-static entry`;
       this.#logger.warn(msg);
@@ -227,7 +267,7 @@ class DnsServer {
   /**
    * Handle an incoming DNS request.
    */
-  async #handleRequest (request: any, send: any, rinfo: any) {
+  async #handleRequest (request: DnsRequest, send: DnsSendFn, _rinfo: unknown) {
     const response = Packet.createResponseFromRequest(request);
     const question = request.questions[0];
     if (!question) {
@@ -270,8 +310,8 @@ class DnsServer {
         // Assume it's a username — look up the user's core
         await this.#answerUsername(response, qname, qtype, prefix);
       }
-    } catch (err: any) {
-      this.#logger.warn(`DNS error for ${qname}: ${err.message}`);
+    } catch (err: unknown) {
+      this.#logger.warn(`DNS error for ${qname}: ${(err as Error).message}`);
       this.#setNxdomain(response);
     }
 
@@ -281,8 +321,10 @@ class DnsServer {
   /**
    * Answer root domain queries with configured records.
    */
-  #answerRoot (response: any, qname: any, qtype: any) {
-    const root = this.#rootRecords;
+  #answerRoot (response: DnsResponse, qname: string, qtype: number) {
+    const root = this.#rootRecords as Record<string, unknown> & {
+      a?: string[]; aaaa?: string[]; ns?: string[]; mx?: Array<{ exchange: string; priority?: number }>; txt?: string[]; caa?: Array<{ flags?: number; tag: string; value: string }>; soa?: Record<string, unknown>;
+    };
     const ttl = this.#ttl;
 
     if (qtype === Packet.TYPE.A || qtype === Packet.TYPE.ANY) {
@@ -325,7 +367,7 @@ class DnsServer {
   /**
    * Answer lsc.{domain} — return all core IPs for rqlite cluster discovery.
    */
-  async #answerClusterDiscovery (response: any, qname: any, qtype: any) {
+  async #answerClusterDiscovery (response: DnsResponse, qname: string, qtype: number) {
     const cores = await this.#platform.getAllCoreInfos();
     const ttl = this.#ttl;
 
@@ -342,7 +384,7 @@ class DnsServer {
   /**
    * Answer a static subdomain entry.
    */
-  #answerStatic (response: any, qname: any, qtype: any, entry: any) {
+  #answerStatic (response: DnsResponse, qname: string, qtype: number, entry: DnsRecordEntry) {
     const ttl = this.#ttl;
 
     if (entry.cname && (qtype === Packet.TYPE.CNAME || qtype === Packet.TYPE.A || qtype === Packet.TYPE.ANY)) {
@@ -374,7 +416,7 @@ class DnsServer {
   /**
    * Answer {username}.{domain} — look up user's core, return its IP or CNAME.
    */
-  async #answerUsername (response: any, qname: any, qtype: any, username: any) {
+  async #answerUsername (response: DnsResponse, qname: string, qtype: number, username: string) {
     const coreId = await this.#platform.getUserCore(username);
     if (coreId == null) {
       this.#setNxdomain(response);
@@ -400,7 +442,7 @@ class DnsServer {
    * — and used for inter-core HTTP routing in multi-core — is unreachable
    * via the embedded DNS unless the operator pre-populates `dns.staticEntries`.
    */
-  async #tryAnswerCoreInfo (response: any, qname: any, qtype: any, prefix: any) {
+  async #tryAnswerCoreInfo (response: DnsResponse, qname: string, qtype: number, prefix: string) {
     const coreInfo = await this.#platform.getCoreInfo(prefix);
     if (coreInfo == null) return false;
     this.#emitCoreInfoRecords(response, qname, qtype, coreInfo);
@@ -410,7 +452,7 @@ class DnsServer {
   /**
    * Emit A / AAAA / CNAME from a coreInfo row.
    */
-  #emitCoreInfoRecords (response: any, qname: any, qtype: any, coreInfo: any) {
+  #emitCoreInfoRecords (response: DnsResponse, qname: string, qtype: number, coreInfo: CoreInfo) {
     const ttl = this.#ttl;
 
     if (coreInfo.ip && (qtype === Packet.TYPE.A || qtype === Packet.TYPE.ANY)) {
@@ -428,7 +470,7 @@ class DnsServer {
   /**
    * Set NXDOMAIN (rcode 3) on response.
    */
-  #setNxdomain (response: any) {
+  #setNxdomain (response: { header: { rcode: number } }) {
     response.header.rcode = 3; // NXDOMAIN
   }
 }
@@ -436,7 +478,7 @@ class DnsServer {
 /**
  * Factory function.
  */
-function createDnsServer ({ config, platform, logger, platformRefreshIntervalMs }: any) {
+function createDnsServer ({ config, platform, logger, platformRefreshIntervalMs }: { config: BoilerConfig; platform: PlatformLike; logger: Logger; platformRefreshIntervalMs?: number }) {
   return new DnsServer({ config, platform, logger, platformRefreshIntervalMs });
 }
 

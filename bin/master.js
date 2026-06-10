@@ -167,6 +167,75 @@ if (cluster.isPrimary) {
       log: (m) => log('[cluster_kv] ' + m)
     });
 
+    // dns-active first-boot DNS chain bootstrap.
+    // Without this block, a fresh single-core dns-active deployment ships
+    // an empty embedded DNS server: parent-zone NS delegation reaches us,
+    // but the apex SOA/NS answer is empty and the recursor discards the
+    // delegation. acme-client's DNS-01 preflight then errors with
+    // "No TXT records found for name: _acme-challenge.<domain>" before
+    // the LE round-trip even starts.
+    //
+    // We seed the bootstrap chain from `dns.publicIp` (collected by the
+    // wizard or hand-set in the YAML):
+    //   - SOA + NS for the apex go into the in-memory boiler config under
+    //     `dns:records:root` (DnsServer's #answerRoot reads only from
+    //     YAML config — PlatformDB-runtime entries are per-subdomain).
+    //   - `A core.<domain>` lands in PlatformDB via setDnsRecord('core')
+    //     so the canonical API hostname resolves to this host.
+    // Idempotency: skip whichever of (root.soa, root.ns, the 'core' entry)
+    // already carries content — operator-managed records, whether typed
+    // into YAML or loaded via `bin/dns-records.js`, always win.
+    let dnsBootstrapFatal = null;
+    if (config.get('dns:active') && config.get('dns:domain')) {
+      const dnsDomain = config.get('dns:domain');
+      const publicIp = config.get('dns:publicIp');
+      if (!publicIp) {
+        dnsBootstrapFatal =
+          `dns.publicIp is unset, but dns.active=true + dns.domain=${dnsDomain}. ` +
+          'The embedded DNS server cannot answer the apex SOA/NS records the parent ' +
+          'zone NS delegation points at. Set dns.publicIp to this host\'s public IPv4 ' +
+          'address and restart.';
+        log('FATAL: ' + dnsBootstrapFatal);
+        log('       ACME orchestrator will NOT start (would burn the LE rate limit on a guaranteed-fail issuance).');
+      } else {
+        const adminEmail = config.get('letsEncrypt:email') || ('admin@' + dnsDomain);
+        const rfc1035Admin = adminEmail.replace('@', '.') + '.';
+        const primaryNs = `core.${dnsDomain}.`;
+        const existingRoot = (config.get('dns:records:root') || {});
+        const nextRoot = { ...existingRoot };
+        let mutated = false;
+        if (!existingRoot.soa) {
+          nextRoot.soa = {
+            primary: primaryNs,
+            admin: rfc1035Admin,
+            serial: Math.floor(Date.now() / 1000),
+            refresh: 3600,
+            retry: 600,
+            expiration: 604800,
+            minimum: 60
+          };
+          mutated = true;
+          log(`[dns-bootstrap] seeded dns.records.root.soa (primary=${primaryNs}, admin=${rfc1035Admin})`);
+        }
+        if (!existingRoot.ns || existingRoot.ns.length === 0) {
+          nextRoot.ns = [primaryNs];
+          mutated = true;
+          log(`[dns-bootstrap] seeded dns.records.root.ns = [${primaryNs}]`);
+        }
+        if (mutated) config.set('dns:records:root', nextRoot);
+
+        const { getPlatform } = require('../components/platform/src/index.ts');
+        const bootstrapPlatform = await getPlatform();
+        const existingCore = await bootstrapPlatform.getDnsRecord('core');
+        if (existingCore == null) {
+          await bootstrapPlatform.setDnsRecord('core', { a: [publicIp] });
+          log(`[dns-bootstrap] published A core.${dnsDomain} -> ${publicIp}`);
+        } else {
+          log(`[dns-bootstrap] A core.${dnsDomain} already set in PlatformDB; not overwriting`);
+        }
+      }
+    }
+
     // Start DNS server if configured
     let dnsServer = null;
     if (config.get('dns:active')) {
@@ -192,7 +261,9 @@ if (cluster.isPrimary) {
     // On the CA-holder (letsEncrypt.certRenewer: true) additionally runs
     // the daily ACME renewal loop (initial issuance + renew-when-expiring).
     let acmeOrchestrator = null;
-    if (config.get('letsEncrypt:enabled')) {
+    if (config.get('letsEncrypt:enabled') && dnsBootstrapFatal) {
+      log('[acme] skipping orchestrator start — dns-active bootstrap FATAL above means DNS-01 cannot succeed.');
+    } else if (config.get('letsEncrypt:enabled')) {
       // First-boot race: workers do `fs.readFileSync(http.ssl.keyFile)` at
       // boot. If ACME hasn't issued yet, that ENOENTs and the cluster
       // restart-loops. Pre-stage a 1-day self-signed cert at the configured
@@ -203,6 +274,8 @@ if (cluster.isPrimary) {
         const placeholder = ensurePlaceholder({ config, log });
         if (placeholder.written) {
           log(`[acme] placeholder cert in place at ${placeholder.certFile}`);
+        } else if (placeholder.restored) {
+          log(`[acme] real LE cert restored at ${placeholder.certFile} from ${placeholder.source}`);
         }
       } catch (err) {
         log('[acme] placeholder cert generation FAILED: ' + err.message + ' (workers may crash on first boot until ACME completes)');
@@ -220,12 +293,62 @@ if (cluster.isPrimary) {
         if (atRestKey.length !== 32) {
           throw new Error(`letsEncrypt.atRestKey must decode to 32 bytes; got ${atRestKey.length}`);
         }
+
+        // HTTP-01 challenge support: when the topology resolves to http-01
+        // (typically `dnsLess.isActive: true`), bind a tiny HTTP server on
+        // :80 that serves /.well-known/acme-challenge/<token> from an
+        // in-memory store. CertRenewer.challengeCreateFn writes into the
+        // same store. DNS-01 mode skips this entirely; only the DNS
+        // writer path is exercised.
+        const { Http01ChallengeStore } = require('business/src/acme/Http01ChallengeStore.ts');
+        const { createHttp01Server } = require('business/src/acme/Http01Server.ts');
+        const http01Store = new Http01ChallengeStore();
+        try {
+          const http01Server = createHttp01Server({
+            store: http01Store,
+            port: 80,
+            host: '0.0.0.0',
+            log: (m) => log('[acme] ' + m)
+          });
+          await http01Server.listenAsync();
+          log('[acme] http-01 challenge server listening on :80');
+        } catch (err) {
+          log('[acme] http-01 server failed to bind :80: ' + err.message);
+          log('[acme]   (DNS-01 deployments can ignore this; http-01 challenges will fail)');
+        }
+
         acmeOrchestrator = buildAcmeOrchestrator({
           config,
           platformDB: platform._db || require('../storages/index.ts').platformDB,
           atRestKey,
           dnsServer,
+          http01Store,
           onRotate: async (certPath, keyPath, hostname) => {
+            // Workers' reloadTls() re-reads from `http.ssl.{certFile,keyFile}`
+            // (Server.buildHttpsOptions) — it does NOT use the certPath/keyPath
+            // carried on the IPC message. So we land the rotated cert at the
+            // configured ssl paths BEFORE the IPC fanout. The materializer
+            // writes the per-host layout (`<tlsDir>/<host>/{fullchain,privkey}.pem`);
+            // we mirror it to the single-path layout the workers actually read.
+            // Without this, in-memory hot-swap silently re-loads the
+            // placeholder and the workers serve self-signed permanently.
+            try {
+              const sslKeyFile = config.get('http:ssl:keyFile');
+              const sslCertFile = config.get('http:ssl:certFile');
+              if (sslKeyFile && sslCertFile) {
+                const fs = require('node:fs');
+                const path = require('node:path');
+                fs.mkdirSync(path.dirname(sslKeyFile), { recursive: true });
+                fs.mkdirSync(path.dirname(sslCertFile), { recursive: true });
+                fs.copyFileSync(certPath, sslCertFile);
+                fs.copyFileSync(keyPath, sslKeyFile);
+                fs.chmodSync(sslCertFile, 0o644);
+                fs.chmodSync(sslKeyFile, 0o600);
+                log(`[acme] copied rotated cert ${certPath} -> ${sslCertFile}`);
+              }
+            } catch (err) {
+              log(`[acme] failed to mirror rotated cert to ssl paths: ${err.message} (workers will still serve the OLD cert until next rotation)`);
+            }
             // Broadcast to every live worker so their HTTPS servers
             // hot-swap to the rotated cert. Workers that aren't serving
             // HTTPS (hfs, previews, and api-server in http-only mode)
