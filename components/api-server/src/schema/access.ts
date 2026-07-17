@@ -31,6 +31,9 @@ function accessSchema (action: string): AccessSchemaShape {
     name: string({ minLength: 1 }),
     permissions: permissions(action),
     lastUsed: helpers.number(),
+    // Routable de-identifying alias substituted for the username in this
+    // access's apiEndpoint and access-info. Read-only (set via randomAlias).
+    alias: string({ minLength: 1, nullable: true }),
     integrity: string({ nullable: true })
   }, {
     additionalProperties: false
@@ -88,6 +91,12 @@ function accessSchema (action: string): AccessSchemaShape {
       app.properties.clientData = helpers.object({});
       shared.properties.clientData = helpers.object({});
 
+      // Opt-in: mint a platform-unique routable alias for this access so its
+      // apiEndpoint hides the real username (de-identification). Input-only;
+      // the resolved value is returned in the `alias` property.
+      app.properties.randomAlias = helpers.boolean();
+      shared.properties.randomAlias = helpers.boolean();
+
       break;
 
     case Action.UPDATE:
@@ -120,8 +129,12 @@ function accessSchema (action: string): AccessSchemaShape {
   return res;
 }
 
-const permissionLevel = string({ enum: ['read', 'contribute', 'manage', 'create-only', 'none'] });
-const featureSetting = string({ enum: ['forbidden'] });
+// Enum values come from the permission-lexicon single point so schema
+// validation can never drift from the business-layer semantics.
+const { PERMISSION_LEVEL_VALUES, FEATURE_SETTING_VALUES } =
+  require('business/src/accesses/permissionSet.ts');
+const permissionLevel = string({ enum: [...PERMISSION_LEVEL_VALUES] });
+const featureSetting = string({ enum: [...FEATURE_SETTING_VALUES] });
 
 function permissions (action: string): unknown {
   const streamPermission = object({

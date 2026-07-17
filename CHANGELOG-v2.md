@@ -1,8 +1,210 @@
 # Changelog - API Changes
 
+## 2.0.0-rc.7 — 2026-07-17
+
+### OAuth2 authorization-code flow (server-side)
+
+Pryv can now act as an **OAuth2 authorization server** (RFC 6749 + PKCE / RFC 7636).
+Third-party applications obtain access tokens through the standard authorization-code
+redirect flow instead of the Pryv-native access-request polling flow (both flows remain
+supported). New endpoints: `GET /.well-known/oauth-authorization-server` (RFC 8414
+discovery), `GET /oauth2/authorize`, `POST /oauth2/token` (authorization_code,
+refresh_token, client_credentials grants). The token response carries a Pryv
+`apiEndpoint` extension so multi-core clients build a working connection; vanilla RFC
+6749 clients that call the wrong core receive `421` with the correct `coreUrl`.
+`Authorization: Bearer <token>` is accepted alongside the bare-token and Basic forms.
+Application accounts are registered out-of-band by the operator (`bin/oauth-client.js`;
+curated registration only). Short-TTL access tokens plus rotating refresh tokens; nine
+`oauth.*` audit event types. Configured under the `oauth:` block (disabled by default).
+See `docs/oauth2.md`.
+
+**Granular consent-offer scopes.** There are no coarse wildcard scopes: the `scope`
+parameter carries exactly one consent-offer reference (`cmc:<offer-name>`), resolved
+through the client registration to an open-link `consent/request-cmc` offer published
+by the app's account. The offer's permission set covers the full `accesses.create`
+grammar (per-stream levels AND feature permissions such as `selfRevoke`); the consent
+screen lets the user untick individual permissions and the minted session access
+carries exactly the kept subset. The durable consent record is a cross-account
+data-grant access on the user's account: revoking it invalidates the refresh chain
+(`invalid_grant`), and narrowing it propagates to the next refreshed access — widening
+always requires a fresh authorization. `client_credentials` treats scope tokens as
+opaque and always serves the app's own account. Consent event-type schemas
+(`consent/*-cmc`) accept the full permission grammar accordingly, and accept triggers
+support an optional `grantedPermissions` consent-downgrade subset.
+
+## 2.0.0-rc.6 — 2026-07-11
+
+### Access aliases (`randomAlias`) — de-identifying endpoints
+
+`accesses.create` accepts an optional `randomAlias: true`. When set, the new
+access is issued a platform-unique, routable alias (`r-` followed by 8
+characters) that replaces the username everywhere the access is addressed: the
+returned `apiEndpoint`, and `access-info` (`user.username` reports the alias).
+The real username never appears for that access, so accesses handed to
+different parties cannot be cross-matched back to one account. The alias routes
+to the user exactly like the username (including across cores) and is released
+when the access is deleted. The resolved value is returned as the access's
+`alias` property.
+
+### Changeable username (`account.changeUsername`)
+
+A new personal-token endpoint `POST /account/change-username` lets a user choose
+a new username. Accesses already issued under the previous username keep
+working — the old name is kept as a routable alias — and `access-info` for those
+accesses reports the new (current) username. The number of changes is capped by
+the operator (default 2); `GET /account/username-changes` returns how many
+changes have been used, the limit, and how many remain.
+
+### CMC: accept no longer fails permanently on data-grant access-name collision (#105)
+
+Accepting a CMC invite with an `accessName` already used by an existing access
+(typical for apps passing a fixed app name on every accept) used to fail
+permanently with the raw database duplicate-key message, and the internal
+retry loop kept re-attempting an accept that could never succeed. The handler
+now retries once with a deterministic per-accept suffix (`<name> (<8 chars of
+the accept event id>)`), so distinct accepts never fight over one name. A
+re-dispatch of the same accept (after a delivery failure) reuses its own prior
+data-grant instead of colliding with it. If the uniquified name still
+collides, the accept fails fast with the new typed, non-retryable error id
+`cmc-handler-data-grant-name-conflict` — no raw database text is echoed.
+
+### Mail-delivery failures no longer leak internal detail in 500 errors (#104)
+
+When a transactional email (password reset, welcome) fails to send, the API
+previously returned a `500` whose message included the configured mail-service
+URL and the raw upstream HTTP status or transport error — visible to
+unauthenticated callers of `account.requestPasswordReset`. The client-facing
+message is now a generic "Sending email failed. Please try again later or
+contact support."; the full diagnostic (URL, upstream status/error, SMTP
+transport failures) is logged server-side instead.
+
+## 2.0.0-rc.5 — 2026-06-25
+
+### Optional encryption-at-rest image variant
+
+A new published image variant `pryvio/open-pryv.io-encrypted` adds optional
+encryption at rest for the data directories (events, attachments, series, audit,
+platform DB). It layers the `container-encrypted-volume` facility onto the stock
+image and mounts an encrypted volume inside the container on boot. The base
+`pryvio/open-pryv.io` image is unchanged, and the variant is off by default
+(`CEV_ENABLED=false`) so it boots identically until opted in. Pluggable backends
+(LUKS / gocryptfs) and key providers (env / file / exec / clevis / aws-kms). See
+the "Encryption at rest" section of `INSTALL.md`.
+
+### `/service/info` can advertise adapters
+
+`/service/info` may now carry an optional `adapters` array — a list of adapter
+base URLs. Adapters are transient converters between Pryv and an external
+standard (for example iCalendar). Each URL serves the adapter's web UI and a
+`manifest.json` describing its name, type, version and capabilities; clients
+fetch `<url>/manifest.json` for the details. `{username}` templating is
+supported, as for the `api` field. Fully additive — the field is absent unless
+configured.
+
+### BREAKING — CMC trigger writes that mint or widen accesses now require a personal token; revoke is access-permission-gated
+
+Writing `consent/accept-cmc` or `consent/scope-update-cmc` to a `:_cmc:apps:*`
+stream now requires the calling access to be **personal**. These two trigger
+types mint (`accept`) or widen (`scope-update`) data-grant accesses on the
+user's account; requiring a personal token enforces user-presence at the
+moment the action is recorded — closing a scope-escalation surface where an
+app token with narrow `:_cmc:apps:*` write permission could trigger creation
+of a much broader `shared` data-grant access derived from a colluding
+requester's offer.
+
+**Revoke uses the standard access-permission gate, not a token-class check.**
+`consent/revoke-cmc` is a contraction (deletion), not an escalation — the
+access being deleted bounds the impact. The `handleRevoke` orchestrator now
+runs `triggerAccess.canDeleteAccess(target)` (the same primitive
+`accesses.delete` uses) before deleting each access in the counterparty pair.
+This honours the `selfRevoke` feature permission on the target accesses, so:
+
+- a personal token can always revoke (covers everything);
+- a relationship's data-grant access can be used by its holder to **self-revoke** the relationship (default `selfRevoke: allow`), without bouncing through `app-web-auth3` — the natural Pryv access-management model;
+- an app token that **created** the access can revoke it;
+- everything else is rejected with `error.data.id === "cmc-revoke-forbidden"`.
+
+Operators who set `selfRevoke: forbidden` on a counterparty access at mint
+time block the self-revoke path explicitly — the existing feature-permission
+contract carries over unchanged.
+
+- **Wire-level rejection (accept + scope-update):** non-personal tokens receive
+  `HTTP 400 invalid-operation` with
+  `error.data.id = "cmc-accept-requires-personal-token"` and
+  `error.data.eventType = "<the rejected event type>"`.
+- **Wire-level rejection (revoke):** `HTTP 400 invalid-operation` with
+  `error.data.id = "cmc-revoke-forbidden"` returned by the orchestrator (the
+  trigger event is persisted with `content.status = "failed"` +
+  `content.failure.reason = "cmc-revoke-forbidden"`).
+- **Un-gated trigger types** are unchanged: `consent/request-cmc`,
+  `consent/refuse-cmc`, `consent/invalidate-link-cmc`,
+  `consent/scope-request-cmc`, and the chat / system / notification families
+  continue to accept any token class with the appropriate stream-write
+  permission.
+- **Plugin-managed access exemption (accept + scope-update):** the gate passes
+  through cross-platform protocol deliveries — capability accesses
+  (`clientData.cmc.kind === "capability"`) and counterparty data-grant accesses
+  (`clientData.cmc.role === "counterparty"`). The cross-user handshake is
+  unaffected.
+- **Defense-in-depth chain checks inside handlers** — closing the long-standing
+  bypass where `mall.accesses.*` calls skipped what the api-server's routes
+  enforce in `applyPrerequisitesFor{Creation,Update}`:
+  - `handleAccept` runs `triggerAccess.canCreateAccess(dataGrantPayload)` before
+    `mall.accesses.create`.
+  - `handleSystemScopeUpdate` runs `triggerAccess.canUpdateAccess(target)` +
+    `triggerAccess.canCreateAccess({permissions: mergedPerms, type: 'shared'})`
+    before `mall.accesses.update`.
+  - `handleRevoke` runs `triggerAccess.canDeleteAccess(target)` (see revoke
+    behaviour above) before each `mall.accesses.delete`.
+
+**Upgrade path for apps without a personal token** — adopt the new
+`@pryv/cmc.requestAccept` / `requestScopeUpdate` helpers (lib-js ≥ next
+minor), which open `app-web-auth3` (≥ next minor) so the user authenticates,
+the personal token writes the trigger, and the data-grant apiEndpoint is
+returned to the app via popup `postMessage` or `returnUrl` redirect. **No
+`requestRevoke` is needed** — apps holding the relationship access can
+self-revoke directly via `cmc.revokeAcceptance(...)` / `cmc.revokeRelationship(...)`
+without bouncing through the auth pages.
+
 ## 2.0.0-rc.4 — 2026-06-18
 
-No API-facing changes. This release hardens multi-core operations: cores now join the cluster as **non-voters by default**, so adding a core can no longer take an existing core's control plane offline (see CHANGELOG-v2-back.md for the full description and the new `--bootstrap-as-voter` / `bin/bootstrap.js promote-core` operator surface).
+### Multi-core: non-voter join by default
+
+This release hardens multi-core operations: cores now join the cluster as **non-voters by default**, so adding a core can no longer take an existing core's control plane offline (see CHANGELOG-v2-back.md for the full description and the new `--bootstrap-as-voter` / `bin/bootstrap.js promote-core` operator surface).
+
+### On-demand encrypted backups (`bin/backup.js`)
+
+The full-platform backup tool can now **encrypt its output on demand** so that
+plaintext PHI/PII never touches the destination disk — the bytes written to the
+backup media are ciphertext only. Encryption is **opt-in**: without the flags
+below, backups behave exactly as before (plaintext JSONL, same filenames).
+
+Two key models:
+
+- **Recipient public key (recommended)** — `--recipient-pubkey <pem>`. A fresh
+  random data key encrypts the backup and is itself wrapped with the recipient's
+  RSA public key (RSA-OAEP, SHA-256). The backup-producing host holds **no secret
+  that can decrypt its own output**; only the holder of the matching private key
+  can restore (`--private-key <pem>`, plus `--private-key-passphrase` if the key
+  is protected).
+- **Passphrase** — `--encrypt-passphrase <s>` (or the `PRYV_BACKUP_PASSPHRASE`
+  env var, which keeps the secret out of the process list). The data key is
+  scrypt-derived from the passphrase. Simpler, but the operator can decrypt its
+  own backups. Restore with `--decrypt-passphrase <s>` / `PRYV_BACKUP_PASSPHRASE`.
+
+Format: each file is encrypted independently (streaming AES-256-GCM in
+authenticated chunks; a per-file subkey is HKDF-derived from a random salt), so
+chunking, `--incremental`, `--no-compress` and single-`--user` restore all keep
+working. A small cleartext `encryption.json` at the backup root records the key
+model and the wrapped data key — crypto headers only, never user data;
+`manifest.json` and every per-user file (including the user manifest and
+attachments) are encrypted. Restore auto-detects an encrypted backup from that
+file.
+
+Disaster-recovery note: **a lost key (or passphrase) makes the backup
+unrecoverable** — that is the point of the feature. For an `--incremental` run
+over an already-encrypted backup, supply the matching secret so the tool can read
+the previous manifest.
 
 ## 2.0.0-rc.3 — 2026-06-17
 

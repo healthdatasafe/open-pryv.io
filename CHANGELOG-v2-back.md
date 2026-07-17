@@ -1,5 +1,123 @@
 # Changelog - Internal (no API impact)
 
+## fix(storage): guard against persisting an access without its integrity hash
+
+When integrity is active for accesses, `AccessesPG` / `AccessesSQLite` now
+assert, at write time in `applyDefaults`, that the access being persisted
+carries a computed `integrity` value. If the integrity step is silently
+skipped (for example because the storage layer was constructed without a
+real integrity reference and fell back to the inert stub), the write now
+fails immediately with a diagnostic error naming the access, the process id
+and whether a real integrity reference was injected — instead of the gap
+surfacing one operation later as an "access has no integrity property"
+whole-store scan failure that is hard to trace back to its origin. No API
+or behavioural change on the healthy path; this only makes an otherwise
+silent inconsistency loud at its source. Covered by unit tests on both
+engines.
+
+## chore(init): default auth UI is now app-web-user-account
+
+The `bin/init.js` config wizard and `bin/check-config.js` now default
+`access.defaultAuthUrl` / `auth.passwordResetPageURL` to the
+`app-web-user-account` React app (routes `/auth`, `/reset-password`) instead
+of the deprecated `app-web-auth3` (`/access/access.html`, …). Fresh installs
+point at the current reference auth+account web app out of the box. No runtime
+API change; existing deployments are unaffected (their configured values are
+untouched).
+
+## feat(cmc): access-permission gates on all access-mutating lifecycle triggers + chain checks in handlers
+
+CMC orchestration previously treated `consent/{accept,scope-update,revoke}-cmc`
+as authoritative user consent regardless of which access wrote them: an app
+token with `:_cmc:apps:<app>:*, contribute` could write a `consent/accept-cmc`
+event whose `capabilityUrl` pointed at a colluding requester offering
+`permissions: [{streamId: '*', level: 'manage'}]`, and the recipient's plugin
+would dutifully mint a `shared` data-grant access on the user with `*/manage`
+— no consent UI shown, no user-presence guarantee. The fix layers an
+events.create gate for the access-mint/widen triggers, an access-permission
+gate inside the revoke handler, and defense-in-depth chain checks in all
+three orchestrators that mutate access state.
+
+### Token-class gate (mint + widen — accept + scope-update)
+
+`cmcAcceptAccessGateHook` (`components/cmc/src/cmcAcceptAccessGate.ts`) is a
+new `events.create` middleware. It rejects `consent/accept-cmc` and
+`consent/scope-update-cmc` writes when `context.access.isPersonal()` returns
+false, with `cmc-accept-requires-personal-token` (400 invalid-operation,
+CMC id at `error.data.id`). Plugin-managed accesses
+(`clientData.cmc.kind === 'capability'` or `clientData.cmc.role === 'counterparty'`)
+are explicitly exempted so the cross-platform handshake — bob's capability
+POST to alice's `:_cmc:_internal:responses:<capId>` and counterparty
+deliveries via the shared data-grant pair — continues to work. Reuses
+`AccessLogic.isPersonal()`; no parallel "is personal" implementation.
+
+### Access-permission gate (revoke)
+
+Revoke is a contraction, not an escalation — the access being deleted bounds
+the impact. `consent/revoke-cmc` is NOT in the events.create gate; instead
+`handleRevoke` calls `triggerAccess.canDeleteAccess(target)` before each
+`mall.accesses.delete` (data-grant + counterparty). This is the same
+primitive `accesses.delete` uses, so the existing `selfRevoke` feature
+permission carries over:
+
+- a personal token always passes;
+- a relationship's data-grant access can be used by its holder to self-revoke (default `selfRevoke: allow`) — no auth-page bounce needed;
+- an app token that created the access can revoke it;
+- everything else is rejected with `cmc-revoke-forbidden`.
+
+Peer-delivered revokes never reach `handleRevoke` (dispatch's
+`isPeerDeliveredEvent` short-circuit on `OUTBOUND_LOOPABLE_TYPES` returns
+`'skipped'` first), so the check doesn't interfere with cross-platform
+delivery.
+
+### Defense-in-depth chain checks inside the access-mutating handlers
+
+The api-server's `accesses.{create,update,delete}` routes enforce
+`access.can{Create,Update,Delete}Access(...)` in `applyPrerequisitesFor{...}`,
+but the CMC plugin used to call `mall.accesses.*` directly — bypassing those
+checks. All three handlers now run the same primitive before the
+storage-layer call, no parallel implementation:
+
+- `handleAccept` → `triggerAccess.canCreateAccess(dataGrantPayload)` before `mall.accesses.create`. Failure: `cmc-insufficient-permissions`.
+- `handleSystemScopeUpdate` → `triggerAccess.canUpdateAccess(target)` + `triggerAccess.canCreateAccess({permissions: mergedPerms, type: 'shared'})` before `mall.accesses.update`. Failure: `cmc-insufficient-permissions`.
+- `handleRevoke` → `triggerAccess.canDeleteAccess(target)` (see above) before each `mall.accesses.delete`. Failure: `cmc-revoke-forbidden`.
+
+The trigger-writer's `AccessLogic` is plumbed through the dispatch's
+per-request deps (`triggerAccess: context?.access`) so the handlers can reach
+it. `handleIncomingAccept`'s back-channel mint stays on direct
+`mall.accesses.create` — its permissions are bounded by the original
+request, which is chain-checked requester-side at publish time.
+
+### Test coverage
+
+- `[CMCAUTH-*]` 10 unit + 8 integration — the events.create gate (now covers accept + scope-update; revoke moved to a separate suite).
+- `[HR-AUTH-*]` 5 unit — `handleRevoke.canDeleteAccess` matrix (personal pass, self-revoke pass, total-no reject, partial reject, skip-when-no-triggerAccess).
+- `[HS-AUTH-*]` 4 unit — `handleSystemScopeUpdate` chain check (personal pass, canUpdate=false reject, canCreate=false reject, skip-when-no-triggerAccess).
+- Existing cross-platform handshake (`[CMCHS-*]` 14 tests) + the full CMC integration surface stay green.
+
+User-facing impact: see `CHANGELOG-v2.md` "BREAKING — CMC trigger writes
+that mint or widen accesses now require a personal token; revoke is
+access-permission-gated" for the wire-level error contracts + the
+`@pryv/cmc.requestAccept` / `requestScopeUpdate` hand-off helpers. No
+`requestRevoke` helper is needed — apps holding the relationship access
+self-revoke directly via the existing `cmc.revokeAcceptance` /
+`cmc.revokeRelationship` calls.
+
+## feat(oauth2): foundation component — discovery doc, scope/error/client registries, PlatformDB keyspaces, app-account CLI
+
+New top-level component `components/oauth2/` lays the groundwork for the OAuth 2.0 authorization-server surface. No public auth flow yet — `/oauth2/authorize` + `/oauth2/token` arrive in a follow-up — but the substrate is fully wired:
+
+- **`.well-known/oauth-authorization-server`** (RFC 8414) discovery doc is served from every core. The `issuer` + endpoints advertise the load-balancer-facing service URL, NOT per-core URLs, so the operator MUST keep the new `oauth.*` config block in sync across cores in a multi-core deployment. Discovery doc advertises `response_types_supported: [code]`, `code_challenge_methods_supported: [S256]` (PKCE mandatory, no plain), `authorization_response_iss_parameter_supported: true` (RFC 9207), and the configured `grantTypesSupported` (starts with `authorization_code`; later milestones add `refresh_token` + `client_credentials`).
+- **Pluggable scope-parser registry** (`registerScopeParser(namespace, parser)`) shipping with the `pryv:` namespace registered (`pryv:read` / `pryv:write` / `pryv:manage`). Future namespaces (e.g. SMART on FHIR) layer on as plugins without migrating persisted scope data.
+- **Hand-maintained Pryv `error.id` → RFC 6749 §5.2 error-enum map** at the endpoint edge; unmapped error.ids fall through to `invalid_request` rather than leaking Pryv-specific strings to OAuth clients.
+- **App-account client registry** backed by a new cluster-wide PlatformDB keyspace `oauth-client/<clientId>` (allowed by the no-credentials-in-PlatformDB invariant — client_secrets stay on the app account's home core). Cross-core `/oauth2/authorize` validates client metadata without round-tripping to the app's home core. Exact-string redirect-URI matching with the loopback-port carve-out (RFC 8252 §7.3) — no regex, no prefix matching.
+- **New PlatformDB ephemeral keyspaces** `oauth-code/<coreId>/<code>` (600 s TTL, single-use) and `oauth-refresh/<coreId>/<token>` (sliding 30 d, hard-cap 90 d absolute). The `coreId` prefix locks codes + refresh tokens to their issuing core (the wrong-core path will server-side-forward `/oauth2/token` in a follow-up milestone — vanilla RFC 6749 clients never see the cross-core hop).
+- **`bin/oauth-client.js`** operator CLI for app-account promotion in `curated` registration mode (the only supported value in this milestone; `oauth.clientRegistration.mode: open` is rejected at config validation). Subcommands: `create <username>` (promotion-only — refuses if the user account doesn't already exist), `show <clientId>`, `list`, `update <clientId>`, `revoke <clientId> --yes` (the `--yes` gate is intentional operator-footgun protection).
+- **`WWW-Authenticate: Bearer`** + **`DPoP`** challenge builders for the middleware layer's 401 responses (RFC 6750 §3); the middleware wire-up arrives with the public flow.
+- **OAuth audit-event helper** (`audit.ts`) defines the event-type catalogue (`oauth.consent.{shown,granted,refused}`, `oauth.code.{exchanged,reused}`, `oauth.token.issued.<grant_type>`, `oauth.token.refreshed`, `oauth.token.revoked`) — emission lands when the public flow does.
+
+Covered by `[OAUTH-SCOPE]` `[OAUTH-ERR]` `[OAUTH-CLIENT]` `[OAUTH-WK]` (component unit tests) and `[PLKV]` `[OAUTH-STORE]` (PlatformDB conformance — both engines).
+
 ## feat(multi-core): cores join as non-voters by default, so adding a core can't take an existing core offline
 
 Adding a core could take a previously-healthy core's control plane **offline**. A new core joined the Raft cluster as a **voter** immediately, so a two-core cluster ran at 2-of-2 quorum: if the new core (or any core) then became unreachable — crash, restart, redeploy, transient network — the survivor lost majority, stepped down, and platform reads/writes stalled. Under container orchestrators this was easy to trip, because a zero-downtime health check could start a new core, let it ack and join as a voter, then stop the container — stranding an unreachable voter. Two further snags made the documented join fail or surprise operators: the bootstrap ack pinned the cluster CA (so it failed against a core whose API is fronted by a public/ACME cert), and there was no guidance on the quorum math.

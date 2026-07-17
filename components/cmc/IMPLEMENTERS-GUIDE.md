@@ -231,7 +231,17 @@ The patient's app renders the consent screen.
 
 ## Step 4 — User accepts (single write on patient's own platform)
 
+> **Token class.** `consent/accept-cmc` and `consent/scope-update-cmc` writes (which **mint or widen** access state on the user's account) require a **personal** access token. App- or shared-access tokens are rejected `400 invalid-operation` with `error.data.id === 'cmc-accept-requires-personal-token'`. The personal-token requirement enforces user-presence at the moment the trigger is recorded.
+>
+> **Revoke (`consent/revoke-cmc`) uses the standard access-permission gate, not the personal-token gate.** `handleRevoke` runs `triggerAccess.canDeleteAccess(target)` (the same primitive `accesses.delete` uses), which honours the `selfRevoke` feature permission on the target access. Apps holding a relationship's data-grant access can self-revoke directly via [`pryv.cmc.revokeAcceptance(...)`](https://github.com/pryv/lib-js/tree/master/components/pryv-cmc) — no hand-off needed. Unauthorised revokes fail with `error.data.id === 'cmc-revoke-forbidden'`.
+>
+> **Two flows for accept + scope-update:**
+>
+> 1. **Direct (when your app already holds a personal token):** post `events.create` from `patientConnection`, as shown below.
+> 2. **Hand-off (when your app holds only an app/shared token):** call [`pryv.cmc.requestAccept(...)`](https://github.com/pryv/lib-js/tree/master/components/pryv-cmc) — it opens app-web-user-account's `/cmc-accept` page where the user signs in, the trigger is written with the fresh personal token, and the data-grant apiEndpoint is returned to your app via popup `postMessage` or `returnUrl` redirect. The sibling `pryv.cmc.requestScopeUpdate(...)` + `/cmc-scope-update` page handles the scope-update accept the same way.
+
 ```js
+// Direct flow — patientConnection authenticated with a personal token.
 await patientConnection.api([
   {
     method: 'events.create',
@@ -245,6 +255,15 @@ await patientConnection.api([
     }
   }
 ]);
+
+// Hand-off flow — patient app holds an app/shared token; defer to app-web-user-account.
+const result = await pryv.cmc.requestAccept({
+  authUrl: 'https://pryv.github.io/app-web-user-account/cmc-accept',
+  pryvApi: 'https://reg.pryv.me/',
+  capabilityUrl: 'https://AbC...Xyz@example.com/',
+  scopeStreamId: ':_cmc:apps:patient:incoming'
+});
+// result = { ok: true, dataGrantApiEndpoint, acceptEventId }
 ```
 
 That's the user's only call. Everything else is server-orchestrated by the user's plugin:
@@ -751,7 +770,16 @@ When the future OAuth2 / app-accounts work ships signed inter-platform notificat
     title:       LocalizableText,
     description: LocalizableText,
     consent:     LocalizableText,
-    permissions: Permission[],
+    // Permission[] plus an optional consent-layer `mandatory?: boolean`
+    // per entry (a mandatory entry must be granted on accept; the
+    // consent UI locks it). `mandatory` is stripped before the
+    // data-grant access is minted.
+    permissions: Array<Permission & { mandatory?: boolean }>,
+    // Default false → the accept is ALL OR NOTHING (the user may only
+    // grant the whole set or refuse). true → the accepter may grant a
+    // subset via `consent/accept-cmc.grantedPermissions` (mandatory
+    // entries still required).
+    allowUserChoice?: boolean,
     features?:   { chat?: boolean, systemMessaging?: boolean },
     expiresAt?:  number,
     customData?: object
@@ -777,7 +805,10 @@ When the future OAuth2 / app-accounts work ships signed inter-platform notificat
 {
   capabilityUrl: string,                      // received out-of-band
   extra?:        { chat?: boolean, systemMessaging?: boolean },
-  accessName?:   string                       // optional override; plugin derives a default
+  accessName?:   string                       // optional override; plugin derives a default.
+                                              // If the name is already taken by another access,
+                                              // the plugin uniquifies it with a deterministic
+                                              // per-accept suffix: `<name> (<8 chars of event id>)`.
 }
 
 // Plugin updates content as orchestration runs
@@ -1271,6 +1302,7 @@ npm package.
 | `HANDLER_OFFER_READ_FAILED` | `cmc-handler-offer-read-failed` | `readOfferViaCapability` threw without a more specific id. |
 | `HANDLER_COUNTERPARTY_UNKNOWN` | `cmc-handler-counterparty-unknown` | The offer didn't carry enough info to derive `{username, host}`. The capability-mint hook now stamps the requester identity on the offer, so this is unreachable in practice — surface for ops if it ever fires. |
 | `HANDLER_DATA_GRANT_CREATE_FAILED` | `cmc-handler-data-grant-create-failed` | `mall.accesses.create` rejected the payload. |
+| `HANDLER_DATA_GRANT_NAME_CONFLICT` | `cmc-handler-data-grant-name-conflict` | The data-grant access name collided with an existing access AND the deterministic uniquified retry collided too. Permanent (non-retryable) — accept again with a different `accessName`. |
 | `HANDLER_DATA_GRANT_NO_APIENDPOINT` | `cmc-handler-data-grant-no-apiendpoint` | The created access lacks `apiEndpoint`. Wiring bug — surface for ops. |
 | `HANDLER_BUILD_DATA_GRANT_FAILED` | `cmc-handler-build-data-grant-failed` | Building the data-grant payload threw before the access call. |
 | `BACK_CHANNEL_CREATE_FAILED` | `cmc-back-channel-create-failed` | Back-channel access mint failed on the requester's side (`handleIncomingAccept`). |

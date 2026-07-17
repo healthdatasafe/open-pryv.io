@@ -66,6 +66,11 @@ const CmcErrorIds = {
   // Capability resolved but the offer stream held more than one event —
   // protocol invariant violation; ops investigation needed.
   CAPABILITY_MULTIPLE_OFFERS: 'cmc-capability-multiple-offers',
+  // The capability read returned a response body larger than the hard
+  // ceiling (a capability endpoint is trusted to return a single small
+  // offer event; an oversize body is a resource-exhaustion / misdirected
+  // fetch signal). The read is aborted and rejected rather than buffered.
+  CAPABILITY_OFFER_TOO_LARGE: 'cmc-capability-offer-too-large',
   // Caller's `request.expiresAt` resolves to a TTL outside the
   // platform-allowed bounds [60s, 30d]. Either the timestamp is in the
   // past / too close to now, or it's farther than 30 days out. Plugin
@@ -84,6 +89,19 @@ const CmcErrorIds = {
   HANDLER_OFFER_MISSING_CAPABILITY_ID: 'cmc-handler-offer-missing-capability-id',
   // The offer carries no `request.permissions` array (or it's empty).
   OFFER_EMPTY_PERMISSIONS: 'cmc-offer-empty-permissions',
+  // The offer's `request.permissions` entries don't match the
+  // accesses.create permission lexicon (stream or feature permission).
+  OFFER_INVALID_PERMISSIONS: 'cmc-offer-invalid-permissions',
+  // An accept trigger's `grantedPermissions` (consent downgrade) is
+  // empty, malformed, or not a subset of the offer's permissions.
+  GRANTED_PERMISSIONS_NOT_SUBSET: 'cmc-granted-permissions-not-subset',
+  // The offer does not allow user choice (`request.allowUserChoice`
+  // false/absent — the DEFAULT): an accept must grant the WHOLE
+  // offered set or the request must be refused.
+  USER_CHOICE_NOT_ALLOWED: 'cmc-consent-user-choice-not-allowed',
+  // A `mandatory: true` offered entry is missing from the granted
+  // subset (cherry-picking never extends to mandatory entries).
+  MANDATORY_PERMISSION_REFUSED: 'cmc-mandatory-permission-refused',
 
   // --- Handler routing ---
   // Dispatch invoked a handler with a trigger whose `.type` doesn't match.
@@ -102,6 +120,10 @@ const CmcErrorIds = {
   // --- Access mint (data-grant + back-channel) ---
   // mall.accesses.create rejected the payload.
   HANDLER_DATA_GRANT_CREATE_FAILED: 'cmc-handler-data-grant-create-failed',
+  // The data-grant access name collided with an existing access AND the
+  // deterministic uniquified retry collided too. Permanent — retrying
+  // cannot converge; the accepter should pick a different accessName.
+  HANDLER_DATA_GRANT_NAME_CONFLICT: 'cmc-handler-data-grant-name-conflict',
   // The created access did not return an `apiEndpoint` — wiring bug
   // (mallAccessesAdapter is supposed to stamp it; surface for ops).
   HANDLER_DATA_GRANT_NO_APIENDPOINT: 'cmc-handler-data-grant-no-apiendpoint',
@@ -161,6 +183,37 @@ const CmcErrorIds = {
   // counterparty role on its own access, bypassing the handshake
   // entirely. Reject up-front.
   CLIENTDATA_CMC_FORBIDDEN: 'cmc-clientdata-cmc-forbidden',
+
+  // --- Token-class gate on accept/scope-update/revoke triggers ---
+  // The events.create trigger for consent/accept-cmc,
+  // consent/scope-update-cmc, or consent/revoke-cmc was written by a
+  // non-personal access (app or shared). These triggers mutate or mint
+  // local accesses on the user's account; a personal token is required
+  // so the user is provably present + authenticated at the moment of
+  // acceptance / revocation / scope change. Apps without a personal
+  // token should hand off to app-web-user-account via @pryv/cmc.requestAccept
+  // (or .requestRevoke / .requestScopeUpdate) — the user authenticates
+  // in app-web-user-account, the personal token writes the trigger, and the
+  // result returns to the app via popup postMessage or returnUrl.
+  ACCEPT_REQUIRES_PERSONAL_TOKEN: 'cmc-accept-requires-personal-token',
+
+  // --- Chain-check failure inside handleAccept ---
+  // Defense-in-depth: even if the access-gate above passes (e.g. a
+  // hypothetical future path bypasses it), handleAccept now invokes
+  // context.access.canCreateAccess(dataGrantPayload) before
+  // mall.accesses.create — mirroring the chain check the api-server's
+  // accesses.create route enforces. A non-personal context with
+  // permissions narrower than the offer's would land here.
+  INSUFFICIENT_PERMISSIONS: 'cmc-insufficient-permissions',
+
+  // --- Revoke permission failure inside handleRevoke ---
+  // The trigger-writing access cannot delete the target counterparty /
+  // data-grant access pair, per the standard AccessLogic.canDeleteAccess
+  // rule (which honours the `selfRevoke` feature permission on the
+  // target accesses). Examples: a shared access that isn't itself the
+  // target trying to revoke; an app token that didn't create the
+  // target; an access with selfRevoke=forbidden trying to self-revoke.
+  REVOKE_FORBIDDEN: 'cmc-revoke-forbidden',
 } as const;
 
 type CmcErrorId = (typeof CmcErrorIds)[keyof typeof CmcErrorIds];
