@@ -323,17 +323,25 @@ describe('[CMCHS] cmc two-user handshake (in-process integration)', function () 
 
     // Wait until the back-channel-cmc landed on bob's inbox — that's
     // the marker that bob's data-grant has been updated with alice's
-    // remote streams for THIS study. Double deadline: this marker is
-    // three chained async hops behind the accept (accept dispatch →
-    // incoming-accept on alice → back-channel POST to bob), and on
-    // loaded full-matrix runs the default 10 s has been seen to lapse
-    // while the chain was still healthy.
+    // remote streams for THIS study.
+    //
+    // Generous deadline (4x): this marker sits THREE chained
+    // fire-and-forget hops behind the accept (accept dispatch on bob →
+    // incoming-accept on alice → back-channel POST back to bob), each
+    // doing real PG + HTTP work through the in-process shim. On an
+    // unloaded box the whole chain lands in well under a second, but
+    // under matrix load it has been seen to exceed both 10 s and 20 s
+    // while remaining perfectly healthy — a lapse here fails a whole
+    // describe's before-all, so the deadline is deliberately far above
+    // the observed worst case rather than close to it. It costs nothing
+    // when the chain is fast (the poll returns as soon as the marker
+    // appears); it only spends time when the box is genuinely slow.
     await pollInboxFor(
       bob.eventsPath, bob.token, 'consent/back-channel-cmc',
       (e) => e.content?.from?.username === alice.username &&
              e.content?.remoteChatStreamId === triggerStreamId + ':chats:' +
                C.slug.counterpartySlug({ username: bob.username, host: 'x.pryv.me' }),
-      POLL_TIMEOUT_MS * 2
+      POLL_TIMEOUT_MS * 4
     );
 
     const TEST_HOST = 'x.pryv.me';
@@ -909,6 +917,42 @@ describe('[CMCHS] cmc two-user handshake (in-process integration)', function () 
         .send({ id: leafStreamId, parentId: ':_cmc:apps', name: appCode });
       assert.strictEqual(verify.body?.error?.id, 'item-already-exists',
         'leaf should exist even for deep-path perm; got ' + JSON.stringify(verify.body));
+    });
+  });
+
+  describe('[CMCHS-UP] raw accesses.update forwarded to the counterparty', function () {
+    // A scope edit performed with plain accesses.update (no CMC trigger
+    // event) must reach the peer's COLLECTORS stream via the route-level
+    // post-hook — system-family types are rejected on the peer's inbox,
+    // which is exactly the regression this test pins.
+
+    it('[CN23] bob edits his data-grant via accesses.update → alice receives consent/scope-update-cmc on her collectors stream', async function () {
+      const h = await runFreshHandshake('study-upd', 'upd-app');
+      const dataGrant = await pollCounterpartyAccessForScope(bob, alice.username, h.triggerStreamId);
+
+      // A fresh stream to widen the grant onto.
+      await ensureStream(bob.streamsPath, bob.token, { id: 'updextra', name: 'Upd Extra' });
+      const newPermissions = (dataGrant.permissions || []).concat([{ streamId: 'updextra', level: 'read' }]);
+
+      const updRes = await coreRequest.put(bob.accessesPath + '/' + dataGrant.id)
+        .set('Authorization', bob.token)
+        .send({ permissions: newPermissions });
+      assert.strictEqual(updRes.status, 200, JSON.stringify(updRes.body));
+
+      const peerNotif = await pollStreamFor(
+        alice.eventsPath, alice.token, h.aliceCollectorStreamId,
+        'consent/scope-update-cmc',
+        (e) => e.content?.source === 'post-hook' &&
+               Array.isArray(e.content?.newPermissions) &&
+               e.content.newPermissions.some((p) => p.streamId === 'updextra')
+      );
+      assert.equal(peerNotif.content.from?.username, bob.username,
+        'delivered scope-update must carry bob as server-stamped origin');
+      // Post-update the access id is the composite <base>:<serial> form
+      // (access versioning bumps the serial on every update).
+      const newAccessId = String(peerNotif.content.newAccessId);
+      assert.ok(newAccessId === dataGrant.id || newAccessId.startsWith(dataGrant.id + ':'),
+        'newAccessId must reference the updated data-grant: ' + newAccessId);
     });
   });
 
