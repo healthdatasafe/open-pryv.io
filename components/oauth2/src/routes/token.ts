@@ -18,16 +18,15 @@
  * status, error, description?}; the dispatcher translates to HTTP.
  */
 
-import { createRequire } from 'node:module';
-const require = createRequire(import.meta.url);
-
-const { handleAuthorizationCode } = require('../grants/authorization_code.ts');
-const { handleRefreshToken } = require('../grants/refresh_token.ts');
-const { handleClientCredentials } = require('../grants/client_credentials.ts');
+import type { Request, Response } from 'express';
+import type { PlatformDB } from '../../../../storages/interfaces/platformStorage/PlatformDB.ts';
+import { handleAuthorizationCode } from '../grants/authorization_code.ts';
+import { handleRefreshToken } from '../grants/refresh_token.ts';
+import { handleClientCredentials } from '../grants/client_credentials.ts';
 
 export type TokenDeps = {
   config: { get (key: string): unknown };
-  platform: any;
+  platform: PlatformDB;
   /** Required when grant_type=refresh_token is dispatched. */
   mintRefreshedAccess?: (params: {
     userId: string; username: string; clientId: string; scope: string[]; expiresAt: number;
@@ -38,6 +37,10 @@ export type TokenDeps = {
   }) => Promise<{ accessId: string; accessToken: string; apiEndpoint: string }>;
   /** Required when grant_type=client_credentials is dispatched. */
   resolveAccountUserId?: (username: string) => Promise<string | null>;
+  /** Optional: collapse a refresh chain on detected reuse (refresh_token grant). */
+  revokeChain?: (params: {
+    userId: string; username: string; clientId: string; dataGrantAccessId?: string;
+  }) => Promise<void>;
 };
 
 /**
@@ -70,7 +73,7 @@ function decodeBasicAuth (headerValue: unknown): { client_id: string; client_sec
 }
 
 export function handleToken (deps: TokenDeps) {
-  return async function token (req: any, res: any): Promise<void> {
+  return async function token (req: Request, res: Response): Promise<void> {
     const body = req.body ?? {};
     const grantType = typeof body.grant_type === 'string' ? body.grant_type : '';
     const basic = decodeBasicAuth(req.headers?.authorization);
@@ -91,7 +94,12 @@ export function handleToken (deps: TokenDeps) {
         outcome = { ok: false, status: 500, error: 'server_error', description: 'refresh_token grant is advertised but not wired on this deployment' };
       } else {
         outcome = await handleRefreshToken(
-          { config: deps.config, platform: deps.platform, mintRefreshedAccess: deps.mintRefreshedAccess },
+          {
+            config: deps.config,
+            platform: deps.platform,
+            mintRefreshedAccess: deps.mintRefreshedAccess,
+            ...(deps.revokeChain != null ? { revokeChain: deps.revokeChain } : {}),
+          },
           { ...body, basic },
         );
       }

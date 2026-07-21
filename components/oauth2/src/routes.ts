@@ -21,6 +21,8 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
+import type { PlatformDB } from '../../../storages/interfaces/platformStorage/PlatformDB.ts';
+
 const { handleWellKnown } = require('./wellKnown.ts');
 const { listNamespaces } = require('./scopeRegistry.ts');
 const { handleAuthorize } = require('./routes/authorize.ts');
@@ -37,7 +39,7 @@ export type Deps = {
    * for the public auth flow (/oauth2/authorize, /accept, /token);
    * `.well-known` works without it.
    */
-  platform?: any;
+  platform?: PlatformDB;
   /**
    * Resolve a user's personal access token to a session handle, or
    * null on failure. Wired by the host app from the existing
@@ -79,6 +81,15 @@ export type Deps = {
   }) => Promise<{ accessId: string; accessToken: string; apiEndpoint: string }>;
   /** Resolve the App account's username to its userId. Required for client_credentials. */
   resolveAccountUserId?: (username: string) => Promise<string | null>;
+  /**
+   * Collapse a refresh chain on detected reuse (refresh_token grant). Storage-
+   * layer-direct: soft-deletes the durable data-grant + all live session accesses
+   * for (user, client) and notifies the counterparty. If absent, reuse is still
+   * detected + audited but the chain is not revoked.
+   */
+  revokeChain?: (params: {
+    userId: string; username: string; clientId: string; dataGrantAccessId?: string;
+  }) => Promise<void>;
 };
 
 /**
@@ -142,6 +153,7 @@ export function registerRoutes (app: { get?: Function; post?: Function; options?
       mintRefreshedAccess: deps.mintRefreshedAccess,
       mintClientAccess: deps.mintClientAccess,
       resolveAccountUserId: deps.resolveAccountUserId,
+      revokeChain: deps.revokeChain,
     }));
 }
 

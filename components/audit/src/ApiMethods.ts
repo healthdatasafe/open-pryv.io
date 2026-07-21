@@ -32,6 +32,9 @@ const ALL_METHODS = [
   'webhooks.get',
   'webhooks.getOne',
   'webhooks.create',
+  'sharedSecrets.create',
+  'sharedSecrets.retrieve',
+  'sharedSecrets.getOne',
   'webhooks.update',
   'webhooks.delete',
   'webhooks.test',
@@ -64,7 +67,22 @@ const ALL_METHODS = [
   'system.getUserInfo',
   'system.listUsers',
   'system.listCores',
-  'auth.hostings'
+  'auth.hostings',
+  // OAuth 2.0 authorization-server events. Emitted directly via
+  // audit.eventForUser() from the oauth2 component's grant/consent paths
+  // (they are NOT api.register API methods, so they never pass through
+  // throwIfMethodIsNotDeclared — but they must be declared here so the
+  // AuditFilter recognises them, otherwise isAudited() returns undefined).
+  'oauth.consent.shown',
+  'oauth.consent.granted',
+  'oauth.consent.refused',
+  'oauth.code.exchanged',
+  'oauth.code.reused',
+  'oauth.token.issued.authorization_code',
+  'oauth.token.issued.client_credentials',
+  'oauth.token.refreshed',
+  'oauth.token.reuse_detected',
+  'oauth.token.revoked'
 ];
 
 const NOT_AUDITED_METHODS = [
@@ -86,7 +104,15 @@ const WITHOUT_USER_METHODS = [
   'auth.delete',
   'system.createUser',
   'system.deactivateMfa',
-  'mfa.recover'
+  'mfa.recover',
+  // OAuth events with no resolvable user at emit time (pre-consent /authorize,
+  // /refuse, or reuse of an already-consumed code/refresh where the user is
+  // unknown). These route to syslog only — never per-user storage — so they
+  // must NOT reach storage.forUser(undefined). Keep in lock-step with
+  // components/oauth2/src/audit.ts#USERLESS_EVENTS.
+  'oauth.consent.shown',
+  'oauth.consent.refused',
+  'oauth.code.reused'
 ];
 
 const WITH_USER_METHODS = AUDITED_METHODS.filter(m => !WITHOUT_USER_METHODS.includes(m));

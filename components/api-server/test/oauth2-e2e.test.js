@@ -327,6 +327,34 @@ describe('[OAUTH-E2E] OAuth 2.0 authorization-code flow (granular consent-offer 
       assert.ok(dataGrant != null, 'CMC data-grant must exist on the user account');
     });
 
+    it('[OE07] the grant emits user-scoped oauth.* audit rows into the user audit trail', async function () {
+      const r = await runFullFlow();
+      assert.equal(r.tokenRes.status, 200, 'POST /oauth2/token: ' + describeRes(r.tokenRes));
+
+      // Consent + code-exchange + token-issuance are user-resolved events,
+      // so they land in the end-user's per-user audit storage, readable via
+      // the :_audit: store with the user's personal token.
+      const auditRes = await coreRequest
+        .get('/' + username + '/events')
+        .set('Authorization', personalToken)
+        .query({ streams: [':_audit:'], limit: 200 });
+      assert.equal(auditRes.status, 200, 'GET :_audit: events: ' + describeRes(auditRes));
+
+      const actions = new Set(
+        (auditRes.body.events ?? [])
+          .map((e) => e.content?.action)
+          .filter((a) => typeof a === 'string' && a.startsWith('oauth.'))
+      );
+      for (const expected of [
+        'oauth.consent.granted',
+        'oauth.code.exchanged',
+        'oauth.token.issued.authorization_code',
+      ]) {
+        assert.ok(actions.has(expected),
+          'expected an audit row for "' + expected + '"; saw oauth actions: ' + JSON.stringify([...actions]));
+      }
+    });
+
     it('[OE03] consent downgrade — offer has diary+health, user keeps health only', async function () {
       const r = await runFullFlow({ grantedPermissions: [{ streamId: 'health', level: 'read' }] });
       assert.equal(r.tokenRes.status, 200, 'POST /oauth2/token: ' + describeRes(r.tokenRes));
@@ -373,6 +401,22 @@ describe('[OAUTH-E2E] OAuth 2.0 authorization-code flow (granular consent-offer 
   });
 
   describe('[OAUTH-E2E-FAIL] negative cases', function () {
+    // A bare 404 out of /oauth2/authorize is ambiguous: route not mounted,
+    // client row missing from PlatformDB, or the consent-offer capability
+    // not resolving. Discriminate them up front so an intermittent failure
+    // in the cases below reports which prerequisite actually broke.
+    beforeEach(async function () {
+      const noParams = await coreRequest.get('/oauth2/authorize');
+      assert.notEqual(noParams.status, 404,
+        '/oauth2/authorize route not mounted: ' + describeRes(noParams));
+      const platformDB = require('storages').platformDB;
+      const clientRow = await storage.getClient(platformDB, clientId);
+      assert.ok(clientRow != null, 'OAuth client fixture missing from PlatformDB: ' + clientId);
+      const capRes = await globalThis.fetch(capabilityUrl);
+      assert.equal(capRes.status, 200,
+        'consent-offer capability URL does not resolve: ' + capabilityUrl + ' -> ' + capRes.status);
+    });
+
     it('[OE10] code reuse → invalid_grant on the second exchange', async function () {
       const r = await runFullFlow();
       assert.equal(r.tokenRes.status, 200);
