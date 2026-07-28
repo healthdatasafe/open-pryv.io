@@ -453,6 +453,21 @@ function buildOptionalAppendix ({ dnsLess, dataFolder, platformEngine = 'rqlite'
 # #           headers: { Authorization: 'Bearer <api-token>' }
 # #           bodyTemplate: '{"to": "{{phoneNumber}}", "text": "{{message}}"}'
 
+# # sso — third-party sign-in (Pryv as an OpenID Connect relying party).
+# # Single-core / dnsLess only in this version. clientSecret is a per-core
+# # secret — keep it YAML-only. At each IdP register the callback served by
+# # THIS core's API host: <callbackBaseURL or public API URL>/auth/sso/<id>/
+# # callback (NOT the landingPageURL host). Unrelated to legacy auth.ssoCookie*.
+# # sso:
+# #   enabled: true
+# #   landingPageURL: ${dnsLess ? 'https://auth.example.com/sso-signin' : 'https://sw.example.com/access/sso-signin'}
+# #   providers:
+# #     google:
+# #       issuer: https://accounts.google.com
+# #       clientId: <from the IdP app registration>
+# #       clientSecret: <per-core secret>
+# #       label: Google
+
 ${HOSTINGS_BLOCK}
 ${PLATFORM_DISKLESS_BLOCK}${ATTACHMENTS_BLOCK}
 # # custom.systemStreams — extend the account schema (e.g. add 'phone',
@@ -472,16 +487,17 @@ ${PLATFORM_DISKLESS_BLOCK}${ATTACHMENTS_BLOCK}
 # #         isShown: true
 # #         isEditable: true
 
-# # observability — opt-in APM (New Relic today; framework supports more).
-# # The license key is stored encrypted in PlatformDB via bin/observability.js;
-# # set 'enabled: true' here to flip the feature on without re-deploying.
+# # observability — opt-in telemetry over OTLP/HTTP (any OTLP-ingesting
+# # backend, including a collector you host yourself). What is sent is a
+# # fixed allow-list: per-method call counts, durations, error counts and
+# # sanitized stack traces. Auth headers are stored encrypted in PlatformDB
+# # via bin/observability.js; set 'enabled: true' here to flip the feature
+# # on without re-deploying.
 # # observability:
 # #   enabled: false
-# #   provider: newrelic
 # #   appName: 'open-pryv.io'
-# #   logLevel: error
-# #   newrelic:
-# #     licenseKey: ''   # leave blank; set via 'bin/observability.js newrelic set-license-key'
+# #   otlp:
+# #     endpoint: ''   # leave blank; set via 'bin/observability.js set-endpoint'
 
 # # platform.piiMode — DEFAULT since 2.0.0-rc.3 is "hashed". The wizard
 # # writes piiMode + a fresh piiHmacKey into the generated config above,
@@ -868,6 +884,11 @@ async function main () {
   const defaultPasswordResetPageURL = `${authUiUrl}/reset-password`;
   const passwordResetPageURL = await ask('  auth.passwordResetPageURL (derived from auth UI)', defaultPasswordResetPageURL);
 
+  // emailVerificationPageURL: sibling page under the same auth UI. Backs the
+  // verify-email link; required unless services.email.enabled.verifyEmail=false.
+  const defaultEmailVerificationPageURL = `${authUiUrl}/verify-email`;
+  const emailVerificationPageURL = await ask('  auth.emailVerificationPageURL (derived from auth UI)', defaultEmailVerificationPageURL);
+
   // trustedApps: must whitelist BOTH the operator's own publicUrl AND the
   // auth UI origin (otherwise the /reg/access flow loaded from the auth app
   // — whichever app-web-user-account host is configured — returns 403 because
@@ -1057,6 +1078,7 @@ async function main () {
       adminAccessKey,
       filesReadTokenSecret,
       passwordResetPageURL,
+      emailVerificationPageURL,
       trustedApps
     },
     access: {
@@ -1094,7 +1116,8 @@ async function main () {
       engines: {
         ...(pgConfig ? { postgresql: pgConfig } : {}),
         filesystem: {
-          attachmentsDirPath: `${dataFolder}/users`,
+          // Attachments co-locate under the user local directory
+          // (sqlite.path); only previews need their own directory.
           previewsDirPath: `${dataFolder}/previews`
         },
         ...(s3Config ? { s3: s3Config } : {}),

@@ -2,6 +2,121 @@
 
 ## Unreleased
 
+### Observability rebuilt: no third-party agent, telemetry built from a fixed allow-list, any OTLP backend
+
+⚠ **If you enabled the optional APM integration in an earlier version, read
+this.** The vendor agent's scrubbing configuration was placed in a file the
+agent does not look for, so it was **never loaded**, and affected deployments
+ran on the agent's built-in defaults: the vendor received request URLs, the
+`Host` header, route parameters (including the username as a first-class
+attribute), obfuscated SQL, and **forwarded application log records including
+their message text**. Assume that behaviour applied for as long as the
+integration was enabled, and check what your provider account holds; ingested
+telemetry usually cannot be deleted on demand.
+
+That defect is fixed, but the response went further than a fix. Configuring an
+agent that instruments everything means enumerating what must *not* leave, and
+anything overlooked (or added by the next agent release) leaves by default.
+**The integration is now built the other way round: no third-party agent runs
+in the process, nothing is auto-instrumented, and telemetry is constructed by
+the platform from a closed vocabulary.** What can be emitted is the vocabulary,
+so the answer to "could a URL, a username or a message body reach the backend?"
+is structural rather than a matter of configuration.
+
+**This replaces the previous integration.** Upgrading is enough to inherit it;
+there is nothing to re-scrub and no vendor-agent settings to review.
+
+- **What is sent**, and nothing else can be: per-API-method call counts,
+  duration histograms and error counts, labelled only with an API method id (a
+  registered identifier from the platform's own method registry), a status class
+  (`2xx`/`3xx`/`4xx`/`5xx`) and an error code from the API's documented error id
+  list; plus the service name, service version, the machine hostname and a
+  worker index. Server-side faults additionally carry a hard-coded message
+  chosen by error code and a stack trace rebuilt from repository-relative
+  frames.
+- **What cannot be sent**: request URLs, query and route parameters, request and
+  response bodies, headers of any kind, usernames, stream and event identifiers,
+  log records, and error *messages*. None has a representation in the emitted
+  schema. Error messages are excluded deliberately and permanently: they
+  routinely interpolate file paths and client input, so the code travels and the
+  message stays in your own logs.
+- **Error reports are aggregated and time-coarsened.** Reports are grouped by
+  fault with a count and stamped at the reporting interval, not at the instant
+  of failure. A precise timestamp is a re-identification handle: "this method
+  failed at 14:32:07.123" singles out one action to anyone holding a second
+  timestamped signal, your own audit log included. The deliberate cost is that
+  sub-interval ordering and exact error times are not available from telemetry.
+- **The instance identifier is the machine hostname**, never derived from your
+  service URL or DNS domain. In DNS-based deployments user-facing hosts are
+  `<username>.<domain>`, so a URL-derived hostname would have been one config
+  change away from attaching a username to every datapoint.
+- **Outbound host names are gone.** The previous integration could not stop the
+  agent reporting the destination host of outbound calls, which for webhooks is
+  an endpoint the operator chose and may itself identify. Nothing observes
+  outbound calls now, so this disappears.
+- **Transport is OTLP over HTTP**, so the destination is a URL plus whatever
+  auth header the backend expects. New Relic, Grafana, Datadog, Honeycomb,
+  Elastic and a self-hosted OpenTelemetry Collector all ingest it. Pointing at a
+  collector inside your own infrastructure keeps telemetry within your trust
+  boundary entirely.
+- **Configuration commands changed** (`bin/observability.js`): `set-endpoint
+  <url>`, `set-header <name> <value>`, `clear-headers` and `set-interval
+  <seconds>` replace the vendor-specific `newrelic set-license-key` and
+  `newrelic set-high-security`, and `enable` no longer takes a provider
+  argument. Headers carry the backend credential and are stored AES-256-GCM
+  encrypted at rest; `show` never echoes them. `set-endpoint` refuses a
+  non-HTTPS destination unless it is local.
+- **`set-interval` is a privacy control**, not just a tuning knob: it sets the
+  granularity at which activity is observable and is the only lever on the
+  low-traffic residual noted below. Default 300s, clamped to 60-3600.
+- **Honest limit**: the emitted content is anonymous by construction, but on a
+  very low-traffic instance "one error in this interval" can still correlate to
+  the only active user. That is a property of traffic volume rather than of the
+  schema, and widening the reporting interval reduces it. We state it rather
+  than claim an unqualified guarantee.
+
+### Multiple emails per account (beta)
+
+An account can now hold more than one email address, each with its own
+verification state, while the singular `email` field stays authoritative as the
+primary. **This feature is beta** — the surface may still change.
+
+- `GET /:username/account` returns an `emails` array alongside the legacy
+  `email` scalar: `[{ value, primary, status: 'pending'|'verified', verifiedAt,
+  verificationMethod }]`. Accounts that never used the feature report their
+  single primary as one verified entry. `verificationMethod` records how an
+  address reached its status: `'email-link'` (the holder clicked a mailed
+  token) and `'operator'` are proved ownership; `'registration'` (the founding
+  email) and `'legacy'` (set via the singular `email` field) are asserted but
+  not proved. A `verified` status alone therefore does not imply proven
+  ownership: check `verificationMethod` for that.
+- `PUT /:username/account` accepts an `emails` operations object, applied in the
+  order add, setPrimary, remove, resend:
+  `{ emails: { add?: [value], remove?: [value], setPrimary?: value, resend?: [value] } }`.
+  – `add` reserves the address (409 `item-already-exists` if another account
+    holds it), records it as `pending`, and mails a verification link.
+  – `remove` refuses the primary; releases the address and drops it.
+  – `setPrimary` refuses unless the target is already `verified`, then swaps the
+    primary (the old primary stays as a verified secondary).
+  – `resend` re-sends the verification mail for a pending address, subject to a
+    cooldown; each send rotates the token so older links stop working.
+- `POST /:username/account/verify-email` — public (the token in the body is the
+  credential, mailed to the address). A valid token marks that address
+  `verified`; unknown, expired and already-used tokens all return the same
+  `invalid-access-token` error. The token is a one-time secret bound to the
+  account and address; the server stores only its hash.
+- Addresses resolve to the account for registration/routing whether primary or
+  secondary; password reset still mails the primary only (unchanged).
+- Existing accounts need no migration: the primary is synthesized from the
+  singular `email` field until the container is first written, so `account.get`
+  returns the same result before and after the container is populated.
+- Config: `account.maxEmails` (default 5, hard cap 20),
+  `account.emailVerification.tokenMaxAgeMs` (default 24h),
+  `account.emailVerification.resendCooldownMs` (default 5 min),
+  `services.email.enabled.verifyEmail` + `services.email.verifyEmailTemplate`,
+  and `auth.emailVerificationPageURL` (required when the verification mail is
+  enabled).
+
 ### Shared secrets: hand a secret to a third party by one-time key
 
 Passing a secret to a third party — typically an apiEndpoint carrying an access
@@ -759,7 +874,7 @@ Additional smaller breaking changes already landed in `2.0.0-pre`: `accesses.cre
 - HF-series ingress on raw deploys requires the optional in-process dispatcher (Plan 67) or an nginx vhost (sample at `docs/nginx-ingress-sample.conf`). The deployed-infra lib-js `[CHFA]` case fails without one; the in-process dispatcher closes it for low-volume deployments. Documented in `faq-infra.md`.
 - `[ASTE][AS02][TJ8S]` audit time-range test is an intermittent matrix flake (passes in isolation, fires occasionally in the full sequential matrix). Same family as the existing `[ZD22]` baseline noise. Not a runtime bug. Tracked in workspace bug log.
 - `[CMCHS-AP][AP01]` CMC back-channel access integrity test is an intermittent matrix flake (~1/2 on test infra; runtime behaviour on deployed infra is unverified pending the RC cut's deploy-validation pass).
-- OAuth2 RFC 6749 surface is deferred to post-v2. The current `/reg/access` flow is Pryv-native; OAuth2 will be additive.
+- OAuth2 RFC 6749 surface is deferred to post-v2. The current `/reg/access` flow is Pryv-native; OAuth2 will be additive. **(Superseded in a later 2.x release: the OAuth2 authorization-code / PKCE flow shipped additively, along with DPoP, `private_key_jwt` client auth, and token revocation — see the OAuth2 entries above and `docs/oauth2.md`. The `/reg/access` flow remains supported.)**
 
 ### Compliance posture
 
@@ -1135,7 +1250,7 @@ See `components/cmc/README.md` for the canonical design, `IMPLEMENTERS-GUIDE.md`
 
 ## Known gaps in v2.0.0
 
-- **OAuth2 authorization code flow** (RFC 6749 `/oauth2/authorize`, `/oauth2/token`, client registration, refresh tokens, PKCE) is **not** in v2. Clients that need OAuth2-style authorization must continue using the existing `/reg/access` polling flow (ported from the former `service-register`).
+- **OAuth2 authorization code flow** (RFC 6749 `/oauth2/authorize`, `/oauth2/token`, client registration, refresh tokens, PKCE) is **not** in v2. Clients that need OAuth2-style authorization must continue using the existing `/reg/access` polling flow (ported from the former `service-register`). **(Superseded: this flow shipped additively in a later 2.x release — `/oauth2/authorize`, `/oauth2/token`, PKCE, refresh tokens, DPoP, and client revocation are now available; see the OAuth2 entries above and `docs/oauth2.md`. The `/reg/access` polling flow remains supported.)**
 
 ## Multi-factor authentication (merged from former service-mfa)
 

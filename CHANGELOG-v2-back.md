@@ -1,5 +1,138 @@
 # Changelog - Internal (no API impact)
 
+## refactor(observability): replace the vendor agent with an allow-list emitter
+
+The optional APM integration is rebuilt around a single choke point instead of
+an in-process vendor agent. Rationale, since it is the whole point: configuring
+an agent that auto-instruments everything makes the data-protection posture a
+property of that agent's evolving defaults, provable only by enumerating what
+must not escape. Constructing telemetry ourselves makes it a property of two
+readable files.
+
+**Removed.** The `newrelic` optional dependency; the provider boot shim
+(`bin/_observability-boot.js`) and its require from all five entrypoints; the
+provider adapter/config directory; the dead log-forwarder module; the
+`setTransactionName` / `recordCustomEvent` / `startBackgroundTransaction`
+façade surface and its call sites, including the named-transaction table in
+`API.ts` and the background-transaction wrapper in `CertRenewer`. Because no
+library is being patched, the "must be the first require in the process"
+constraint is gone with it.
+
+**Added**, all under `components/business/src/observability/`:
+- `schema.ts` — the allow-list: metric names, per-metric attribute keys, closed
+  enums, and the method-id and error-code vocabularies registered at startup.
+  Validation returns a drop reason rather than throwing.
+- `emitter.ts` — the choke point. Validates, aggregates in memory (delta
+  counters and fixed-bound histograms), batches on a timer off the request
+  path, and drops-and-counts anything refused or unsendable under
+  `telemetry.dropped`. Bounded buffers; a failing backend costs a counter.
+- `sanitizeError.ts` — class name plus stack frames, absolute paths rewritten
+  repository-relative, frames from outside the repository discarded, and the
+  message never forwarded.
+- `errorRegistry.ts` — reuses `ErrorIds` as the code vocabulary, so emitted
+  codes are the ones the API already documents; decides which failures deserve
+  a stack (5xx, unexpected, unclassifiable) versus counting only.
+- `otlp.ts` — OTLP/HTTP JSON payload builders, hand-rolled. No vendor SDK and
+  no OpenTelemetry SDK: an SDK is precisely the kind of dependency that
+  auto-instruments and widens the surface unnoticed.
+- `startup.ts` — starts the emitter from the environment master resolved.
+
+**Wiring.** `API.call` is the single instrumentation site: method id, outcome
+and duration are all known there, and it serves HTTP and socket calls alike.
+`Application.initiate` starts the emitter after the routes are registered,
+because the method registry *is* the emitter's vocabulary. `Platform`'s
+observability config swaps the vendor key for `otlp-endpoint` plus an encrypted
+`otlp-headers` map, which is what makes the backend interchangeable.
+
+**Two defects that only a deployment surfaced**, both fixed, and both worth
+recording because they are the failure grammar this layer was rebuilt to
+retire: telemetry that reports success while emitting nothing.
+
+- **The emitter attached with an empty vocabulary.** API method modules
+  register in `Server.registerApiMethods`, which runs after
+  `Application.initiate`, where startup had been placed — so the emitter
+  came up knowing zero method ids and would have refused every datapoint as
+  `unknown-method-id`. The deployed log line read `telemetry emitter active
+  (0 methods)`. Startup moved to the end of `registerApiMethods`, and
+  `startFromEnv` now REFUSES to attach on an empty vocabulary with a legible
+  reason rather than activating inert. `[OB11]` pins the refusal. The local
+  suite could not have caught this: its tests hand the vocabulary in
+  explicitly, and nothing asserted that the real wiring supplies one.
+- **A rising `telemetry.dropped` said nothing about what was refused.** The
+  drop path now names the offending value in the LOCAL log alongside the
+  reason. Local logs already carry identifiers, so this adds no exposure, and
+  it never becomes part of a payload.
+
+**The reporting interval is now a real control.** It was hard-coded while the
+documentation already told operators they could widen it to reduce the
+low-traffic correlation residual. `observability set-interval <seconds>`
+stores it in PlatformDB, master resolves it with the rest of the posture,
+workers receive it, and the emitter clamps it to 60-3600 so a
+misconfiguration cannot make individual activity finely observable. Default
+raised 60s to 300s.
+
+**Tests.** `[OBS1]`-`[OBSQ]` (business unit suite) are the filter proof: they
+ask the validator what it decided for accepted *and* refused inputs, including
+a fuzz pass over identifier-shaped keys and values, with a legitimate datapoint
+pinned in each block so the suite cannot pass by dropping everything. `[OB01]`-
+`[OB10]` cover config resolution, encrypted round-trip, worker env propagation
+and startup refusal; `[OC01]`-`[OC08]` cover the CLI.
+
+## fix(config): invalid-config problems now mirror to stderr so a fresh-deploy exit is diagnosable
+
+On a fresh deploy the boiler logger's only sink is a log file that may not exist yet; an invalid config then produced `exit 1` with no output at all, forcing operators to wrap `process.exit` to find the caller. `config-validation.js` now factors the reporting into `reportProblems()`, which writes the header + every problem to stderr (tagged `[config-validation]`) in addition to the logger, before `load()` exits — stderr always reaches the operator (terminal, systemd journal, container stdout). Unit test `[CVSE-01]` asserts the mirror. Also: `tools/performance/README.md` now names rqlite instead of the removed "platform" SQLite engine.
+
+## fix(filesystem): remove the dead `attachmentsDirPath` config knob
+
+`storages.engines.filesystem.attachmentsDirPath` was declared required in the engine manifest and set in every config file, but read by no code path: event attachments co-locate with per-user data under the user local directory (`storages.engines.sqlite.path`) via `UserLocalDirectory.getPathForUser(userId, 'attachments')`. The knob was a leftover from before that refactor and actively misleading — `paths-config` and `production-config` pointed it at a separate directory that stayed empty. Removed from the manifest, default/production config, `paths-config` and `bin/init.js` (kept mirrored), documented the co-location in `userLocalDirectory` + the manifest previews description, and scrubbed the stale INSTALL.md examples (including the encrypted-volume one that recreated the empty-directory trap). No behaviour change — `getPathForUser` is untouched, so attachments land exactly where they already did; `manifest.configuration.fields` is declarative (not validated), so removing the field is inert.
+
+## fix(observability): the agent never loaded its config file, the high-security opt-in was dead code, and the posture is now test-pinned
+
+Three internal gaps behind the operator-visible scrubbing change.
+
+**The agent never loaded the config file.** It discovers configuration by
+scanning `NEW_RELIC_HOME` for exactly `newrelic.js`, `newrelic.cjs`,
+`newrelic.mjs`, or whatever `NEW_RELIC_CONFIG_FILENAME` names, and otherwise
+falls back silently to environment variables and built-in defaults. The config
+lived in `newrelic.ts`, which is invisible to that scan, and the provider boot
+module only calls `require('newrelic')` without referencing it. Verified against
+the pinned agent's own loader: with the directory as it was, the agent resolved
+`attributes.exclude: []`, `record_sql: 'obfuscated'` and
+`application_logging.forwarding.enabled: true`. The configuration is now in
+`newrelic.cjs` (`.cjs` because the package is ESM and the agent uses `require`),
+with `newrelic.ts` re-exporting it so callers and tests read the same object.
+`[OBSC5]` asks the agent's loader what it resolved, so this class of gap fails a
+test rather than passing silently: every other assertion in the suite inspected
+our own exported object and was happy throughout.
+
+**The high-security opt-in never worked.** The worker-env builder read
+`obs.newrelic.highSecurity`, but the platform config resolver never returned
+that field and no CLI command could set it, so the corresponding environment
+variable was always `false` regardless of operator intent. The resolver now
+reads a `newrelic-high-security` platform row (stored in the clear: it is not a
+secret, and operators compare it across cores), a local YAML override wins over
+it exactly as it does for `enabled`, and `observability newrelic
+set-high-security` writes it. Covered by `[OBHS]`-`[OBHS4]`, which assert the
+row reaches the resolved config and the worker environment rather than just the
+database.
+
+**Agent config constants are now test-pinned.** The exclusion list, URL
+obfuscation pattern, `record_sql: 'off'` and the log-forwarding default are
+quoted verbatim in customer-facing data-flow documentation, so `[OBSC]`-`[OBSC4]`
+assert each of them. A future edit that loosens the posture now fails a test
+instead of silently contradicting published documentation. `[OBSC4]` loads the
+config in a child process on purpose: the log-forwarding default is evaluated at
+module load and these modules load through ESM interop, so clearing the module
+cache in-process does not re-evaluate them.
+
+**Diagnostics.** `observability show` now prints the high-security state and a
+summary of what is and is not sent to the provider, and reports the
+log-forwarding line conditionally since it cannot observe the service process's
+environment from another shell. When storage engine start-up fails, the command
+now explains that engine start-up opens the user-data connection before it
+reaches the platform database, instead of surfacing a raw driver authentication
+error that sends operators looking in the wrong place.
+
 ## fix(messages): pubsub workers now reconnect after the broker is lost
 
 The internal TCP pub/sub bus (used, among other things, to broadcast cache

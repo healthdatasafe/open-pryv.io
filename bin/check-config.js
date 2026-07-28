@@ -92,11 +92,63 @@ for (const key of ['adminAccessKey', 'filesReadTokenSecret']) {
   }
 }
 
+// auth.emailVerificationPageURL — required unless services.email.enabled.verifyEmail === false
+{
+  const emailEnabled = get('services.email.enabled');
+  let verifyEmailNeeded = true;
+  if (emailEnabled === false) verifyEmailNeeded = false;
+  if (emailEnabled && typeof emailEnabled === 'object' && emailEnabled.verifyEmail === false) verifyEmailNeeded = false;
+  if (verifyEmailNeeded && isMissingOrSentinel(get('auth.emailVerificationPageURL'))) {
+    problems.push('auth.emailVerificationPageURL missing or unset (required unless services.email.enabled.verifyEmail is false)');
+  }
+}
+
 // letsEncrypt.* — required when letsEncrypt.enabled is true
 if (get('letsEncrypt.enabled') === true) {
   for (const key of ['atRestKey', 'email']) {
     if (isMissingOrSentinel(get(`letsEncrypt.${key}`))) {
       problems.push(`letsEncrypt.${key} missing or unset (required when letsEncrypt.enabled is true)`);
+    }
+  }
+}
+
+// sso.* — third-party sign-in (OIDC relying party). Mirrors checkSsoConfig +
+// the sso.landingPageURL REQUIRED_WHEN in config/plugins/config-validation.js.
+if (get('sso.enabled') === true) {
+  if (get('dns.active') === true) {
+    problems.push('sso.enabled is true but dns.active is also true — SSO is single-core / dnsLess only in this version; disable one of the two');
+  }
+  const callbackBaseURL = get('sso.callbackBaseURL');
+  if (typeof callbackBaseURL === 'string' && callbackBaseURL !== '') {
+    let cbOk = false;
+    try { cbOk = new URL(callbackBaseURL).protocol === 'https:'; } catch (e) { cbOk = false; }
+    if (!cbOk) problems.push('sso.callbackBaseURL must be a valid https URL when set');
+  }
+  const providers = get('sso.providers');
+  if (Array.isArray(providers)) {
+    problems.push('sso.providers must be a map keyed by provider id, not a list');
+  }
+  const providerIds = (providers && typeof providers === 'object' && !Array.isArray(providers)) ? Object.keys(providers) : [];
+  if (providerIds.length > 0 && isMissingOrSentinel(get('sso.landingPageURL'))) {
+    problems.push('sso.landingPageURL missing or unset (required when sso.enabled is true and providers are configured)');
+  }
+  const SSO_PROVIDER_ID_RE = /^[a-z0-9](?:[a-z0-9_-]{0,30}[a-z0-9])?$/;
+  for (const id of providerIds) {
+    if (!SSO_PROVIDER_ID_RE.test(id)) {
+      problems.push(`sso.providers.${id}: id must be a url-safe slug (lowercase letters/digits, '-' or '_')`);
+    }
+    const issuer = get(`sso.providers.${id}.issuer`);
+    if (isMissingOrSentinel(issuer)) {
+      problems.push(`sso.providers.${id}.issuer missing or unset`);
+    } else {
+      let httpsOk = false;
+      try { httpsOk = new URL(issuer).protocol === 'https:'; } catch (e) { httpsOk = false; }
+      if (!httpsOk) problems.push(`sso.providers.${id}.issuer must be a valid https URL`);
+    }
+    for (const key of ['clientId', 'clientSecret']) {
+      if (isMissingOrSentinel(get(`sso.providers.${id}.${key}`))) {
+        problems.push(`sso.providers.${id}.${key} missing or unset (required for a configured provider)`);
+      }
     }
   }
 }

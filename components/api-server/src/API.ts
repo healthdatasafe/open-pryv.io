@@ -10,8 +10,10 @@ const APIError = require('errors').APIError;
 const errors = require('errors').factory;
 const Result = require('./Result.ts').default;
 const { getConfigSync, getLogger } = require('@pryv/boiler');
+const observability = require('business/src/observability/index.ts');
 
 const logger = getLogger('api');
+
 
 type AuditModule = { default?: { validApiCall (ctx: unknown, result: unknown): Promise<void> }; validApiCall? (ctx: unknown, result: unknown): Promise<void> } & { validApiCall (ctx: unknown, result: unknown): Promise<void> };
 type MethodContext = { methodId: string; tracing: { startSpan (n: string, tags?: Record<string, unknown>, parent?: string): void; finishSpan (n: string): void; setError (n: string, err: unknown): void }; username?: string; [k: string]: unknown };
@@ -184,6 +186,13 @@ class API {
 
     if (methodList == null) { return callback(errors.invalidMethod(methodId), null); }
 
+    // Telemetry choke point for the whole API: every call, from HTTP or
+    // from a socket, passes here with its method id known and its outcome
+    // decided in `finalize`. `methodId` is safe to emit because it is a
+    // registered identifier from this process's own method map, and the
+    // emitter re-checks it against that registry before sending.
+    const startedAtMs = Date.now();
+
     const tracing = context.tracing;
     const tags = context.username != null ? {} : { username: context.username };
     const apiSpanName = 'api:' + methodId;
@@ -240,8 +249,11 @@ class API {
       if (err != null) {
         tracing.setError(apiSpanName, err);
         tracing.finishSpan(apiSpanName);
-        return callback(err instanceof APIError ? err : errors.unexpectedError(err));
+        const apiError = err instanceof APIError ? err : errors.unexpectedError(err);
+        observability.recordApiCall(methodId, Date.now() - startedAtMs, apiError);
+        return callback(apiError);
       }
+      observability.recordApiCall(methodId, Date.now() - startedAtMs);
       if (isAuditActive) {
         result.onEnd(async function () {
           await audit.validApiCall(context, result);

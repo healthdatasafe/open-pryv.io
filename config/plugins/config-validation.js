@@ -45,6 +45,18 @@ const REQUIRED_WHEN = [
       return true;
     }
   },
+  // `auth.emailVerificationPageURL` backs the verify-email link — same gating
+  // as passwordResetPageURL but keyed on the `verifyEmail` kill-switch. Mirror
+  // the runtime gate in `methods/account.ts` (isVerifyMailEnabled) exactly.
+  {
+    path: 'auth:emailVerificationPageURL',
+    when: c => {
+      const enabled = c.get('services:email:enabled');
+      if (enabled === false) return false;
+      if (enabled != null && typeof enabled === 'object' && enabled.verifyEmail === false) return false;
+      return true;
+    }
+  },
   // Admin keys & secrets — always required at boot. Multi-core bootstrap
   // already enforces `filesReadTokenSecret` via REQUIRED_AUTH_SECRETS;
   // single-core deploys had no equivalent guard until now.
@@ -52,7 +64,19 @@ const REQUIRED_WHEN = [
   { path: 'auth:filesReadTokenSecret', when: () => true },
   // LetsEncrypt at-rest secrets — required only when the feature is on.
   { path: 'letsEncrypt:atRestKey', when: c => c.get('letsEncrypt:enabled') === true },
-  { path: 'letsEncrypt:email', when: c => c.get('letsEncrypt:enabled') === true }
+  { path: 'letsEncrypt:email', when: c => c.get('letsEncrypt:enabled') === true },
+  // `sso.landingPageURL` receives the one-time sign-in handoff after a
+  // successful third-party (OIDC) login — required once SSO is enabled with at
+  // least one provider, else the callback has nowhere to hand off. (Structural
+  // per-provider validation is in checkSsoConfig below.)
+  {
+    path: 'sso:landingPageURL',
+    when: c => {
+      if (c.get('sso:enabled') !== true) return false;
+      const providers = c.get('sso:providers');
+      return providers != null && typeof providers === 'object' && Object.keys(providers).length > 0;
+    }
+  }
 ];
 
 // A value is treated as "missing / unset" if it would render the feature
@@ -156,6 +180,93 @@ function checkDnsTopologyConsistency (config, problems) {
   }
 }
 
+// Structural validation for the third-party sign-in (OIDC relying party)
+// block. Only runs when `sso.enabled` is true (the opt-in feature). Enforces:
+//   - v1 is single-core / dnsLess only: `sso.enabled` alongside the embedded
+//     DNS (`dns.active: true`) is refused — per-core callback URIs / cross-core
+//     session handoff have no clean v1 answer (deferred to a dedicated design);
+//   - each provider id is a url-safe slug (it appears in callback paths and in
+//     platform field names);
+//   - each configured provider carries a parseable https `issuer` and a
+//     non-sentinel `clientId` / `clientSecret`.
+const SSO_PROVIDER_ID_RE = /^[a-z0-9](?:[a-z0-9_-]{0,30}[a-z0-9])?$/;
+
+function checkSsoConfig (config, problems) {
+  if (config.get('sso:enabled') !== true) return;
+
+  if (config.get('dns:active') === true) {
+    problems.push({
+      message: "'sso.enabled: true' is single-core / dnsLess only in this version and cannot run with the embedded DNS ('dns.active: true'). Multi-core SSO is deferred — disable one of the two.",
+      path: ['sso', 'enabled'],
+      payload: { 'dns.active': true }
+    });
+  }
+
+  // Optional callback base — when set it is the base of the IdP-registered
+  // redirect URI, so a non-https / unparseable value is a misconfiguration.
+  const callbackBaseURL = config.get('sso:callbackBaseURL');
+  if (typeof callbackBaseURL === 'string' && callbackBaseURL !== '') {
+    let parsed = null;
+    try { parsed = new URL(callbackBaseURL); } catch (e) { parsed = null; }
+    if (parsed == null || parsed.protocol !== 'https:') {
+      problems.push({
+        message: `sso.callbackBaseURL must be a valid https URL when set. Got: ${JSON.stringify(callbackBaseURL)}.`,
+        path: ['sso', 'callbackBaseURL'],
+        payload: { callbackBaseURL }
+      });
+    }
+  }
+
+  const providers = config.get('sso:providers');
+  // Empty providers is allowed: the feature soft-degrades to no routes.
+  if (providers == null || typeof providers !== 'object') return;
+  // Must be a MAP keyed by provider id, not a YAML list — array indices would
+  // pass the slug check and mount `/auth/sso/0/...`, silently wrong.
+  if (Array.isArray(providers)) {
+    problems.push({
+      message: 'sso.providers must be a map keyed by provider id (e.g. `providers:` then `  google: {...}`), not a list.',
+      path: ['sso', 'providers'],
+      payload: {}
+    });
+    return;
+  }
+
+  for (const id of Object.keys(providers)) {
+    const base = ['sso', 'providers', id];
+    if (!SSO_PROVIDER_ID_RE.test(id)) {
+      problems.push({
+        message: `sso provider id '${id}' must be a url-safe slug (lowercase letters/digits, '-' or '_') — it appears in callback paths and platform field names.`,
+        path: base,
+        payload: { id }
+      });
+    }
+    const provider = providers[id] || {};
+    const issuer = provider.issuer;
+    if (isMissingOrSentinel(issuer)) {
+      problems.push({ message: `sso.providers.${id}.issuer is missing or unset.`, path: base.concat('issuer'), payload: { id } });
+    } else {
+      let parsed = null;
+      try { parsed = new URL(issuer); } catch (e) { parsed = null; }
+      if (parsed == null || parsed.protocol !== 'https:') {
+        problems.push({
+          message: `sso.providers.${id}.issuer must be a valid https URL. Got: ${JSON.stringify(issuer)}.`,
+          path: base.concat('issuer'),
+          payload: { id, issuer }
+        });
+      }
+    }
+    for (const key of ['clientId', 'clientSecret']) {
+      if (isMissingOrSentinel(provider[key])) {
+        problems.push({
+          message: `sso.providers.${id}.${key} is missing or unset (required for a configured provider).`,
+          path: base.concat(key),
+          payload: { id }
+        });
+      }
+    }
+  }
+}
+
 async function validate (config) {
   // Collect every validation problem in one pass so the operator sees the
   // full list in a single boot-and-fail cycle instead of one-per-restart.
@@ -177,6 +288,7 @@ async function validate (config) {
   checkAuditOnUserDeleteMode(config, problems);
   checkDnsTopologyConsistency(config, problems);
   checkPlatformEngineTopology(config, problems);
+  checkSsoConfig(config, problems);
 
   return problems;
 }
@@ -239,24 +351,44 @@ function formatProblem (p) {
   return 'Configuration is invalid at [' + (p.path || []).join(':') + '] ' + p.message;
 }
 
+/**
+ * Report all validation problems to BOTH the boiler logger and stderr.
+ *
+ * The logger's only sink is the configured log file, which on a fresh deploy
+ * may not exist yet / be unwritable - the logger then silently swallows the
+ * writes and the operator sees a bare `exit 1` with no diagnostics. Mirroring
+ * to stderr unconditionally guarantees the problems reach the operator
+ * (terminal, systemd journal, container stdout) even when the file sink is
+ * dead. Does NOT exit - the caller decides that.
+ */
+function reportProblems (problems) {
+  if (logger == null) logger = getLogger('validate-config');
+  const header = `Configuration is invalid — ${problems.length} problem(s) found:`;
+  logger.error(header);
+  process.stderr.write('[config-validation] ' + header + '\n');
+  for (const p of problems) {
+    logger.error(formatProblem(p), p.payload);
+    process.stderr.write('[config-validation] ' + formatProblem(p) + '\n');
+  }
+}
+
 module.exports = {
   load: async function (store) {
     logger = getLogger('validate-config');
     const problems = await validate(store);
     if (problems.length === 0) return;
-    logger.error(`Configuration is invalid — ${problems.length} problem(s) found:`);
-    for (const p of problems) {
-      logger.error(formatProblem(p), p.payload);
-    }
+    reportProblems(problems);
     process.exit(1);
   },
   // Exported for unit testing — kept stable so [CV-REQ] / future tests can
   // exercise the validator without booting the boiler init lifecycle.
   validate,
+  reportProblems,
   checkRequiredWhen,
   checkAuditOnUserDeleteMode,
   checkDnsTopologyConsistency,
   checkPlatformEngineTopology,
+  checkSsoConfig,
   isMissingOrSentinel,
   REQUIRED_WHEN,
   AUDIT_ON_USER_DELETE_MODES

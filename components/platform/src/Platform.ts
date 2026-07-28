@@ -1051,10 +1051,11 @@ class Platform {
    * Build the effective observability config by merging:
    *   1. Defaults + local YAML override (under `observability:` in config).
    *   2. Cluster-wide values from PlatformDB (under `observability/<key>`).
-   *   3. Derived fields: `hostname` from `new URL(core.url).hostname`,
-   *      `appName` fallback to `dns.domain` when unset.
+   *   3. Derived fields: `hostname` from the MACHINE (`os.hostname()`,
+   *      never the URL layer — see `#deriveHostname`), `appName` fallback
+   *      to `dns.domain` when unset.
    *
-   * Secrets (license keys) are at-rest-encrypted via `AtRestEncryption`
+   * Secrets (the backend auth headers) are at-rest-encrypted via `AtRestEncryption`
    * with HKDF-derived keys per provider. The source material is
    * `auth.adminAccessKey` — every cluster has one, and it's already
    * the operator-sync secret.
@@ -1067,7 +1068,7 @@ class Platform {
    *   appName: string,
    *   logLevel: 'error' | 'warn' | 'info' | 'debug',
    *   hostname: string,
-   *   newrelic: { licenseKey: string }
+   *   otlp: { endpoint: string, headers: Record<string, string> }
    * }>}
    */
   async getObservabilityConfig () {
@@ -1077,7 +1078,7 @@ class Platform {
       provider?: string;
       logLevel?: string;
       appName?: string;
-      newrelic?: { licenseKey?: string };
+      otlp?: { endpoint?: string; headers?: Record<string, string>; flushIntervalSeconds?: number };
     };
     const localYaml = (this.#config.get('observability') || {}) as ObservabilityYaml;
     const dbRows = await this.#db.getAllObservabilityValues();
@@ -1112,18 +1113,29 @@ class Platform {
       appName = domain ? 'open-pryv.io (' + domain + ')' : 'open-pryv.io';
     }
 
-    // Hostname: derive from core.url if it's a URL; else fall back to
-    // dns.domain (prefixed with "single.") or OS hostname as last resort.
+    // Hostname: the machine's own, never anything from the URL layer.
+    // See `#deriveHostname` for why that distinction is load-bearing.
     const hostname = this.#deriveHostname();
 
-    // Decrypt provider secrets on demand — only if they exist AND the
-    // operator hasn't set a local override in YAML.
-    const newrelic = {
-      licenseKey: localYaml.newrelic?.licenseKey ||
-        await this.#decryptObservabilitySecret('newrelic-license-key', db['newrelic-license-key'])
-    };
+    // Telemetry destination. The endpoint is plain config; the headers
+    // carry the backend's credential (an api-key, a bearer token, basic
+    // auth — whatever that backend wants), so they are stored encrypted at
+    // rest. Keeping auth as an opaque header map rather than a named
+    // vendor key is what makes the destination interchangeable: any
+    // OTLP-ingesting backend is reachable with a URL and its own header.
+    // YAML wins over DB, consistent with the `enabled` override path.
+    const endpoint = localYaml.otlp?.endpoint ||
+      (db['otlp-endpoint'] != null ? parseJsonString(db['otlp-endpoint']) : '');
+    const headers = localYaml.otlp?.headers ||
+      parseHeaders(await this.#decryptObservabilitySecret('otlp-headers', db['otlp-headers']));
+    // Reporting interval. This is a privacy control (it sets how finely
+    // activity is observable), so it is part of the resolved posture
+    // rather than a hard-coded constant; the emitter clamps it.
+    const flushIntervalSeconds = localYaml.otlp?.flushIntervalSeconds ??
+      (db['otlp-flush-interval'] != null ? Number(parseJsonString(db['otlp-flush-interval'])) : null);
+    const otlp = { endpoint, headers, flushIntervalSeconds };
 
-    return { enabled, provider, appName, logLevel, hostname, newrelic };
+    return { enabled, provider, appName, logLevel, hostname, otlp };
   }
 
   /**
@@ -1147,16 +1159,18 @@ class Platform {
     await this.#db.deleteObservabilityValue(key);
   }
 
+  /**
+   * Telemetry instance identity: the MACHINE's hostname, and nothing
+   * derived from the API's URL scheme.
+   *
+   * ⚑ This must never be resolved from `core.url` / `dns.domain`. In
+   * DNS-ful deployments user-facing hosts are `<username>.<domain>`, so
+   * any hostname taken from the URL layer is one config change away from
+   * carrying a username, and it would then be attached to EVERY metric and
+   * every error report as a direct identifier. `os.hostname()` is set by
+   * the OS or the container runtime and has no path to a user id.
+   */
   #deriveHostname (): string {
-    const coreUrl = this.#config.get('core:url') as string | undefined;
-    if (coreUrl) {
-      try {
-        const h = new URL(coreUrl).hostname;
-        if (h) return h;
-      } catch { /* fall through */ }
-    }
-    const domain = this.#config.get('dns:domain') as string | undefined;
-    if (domain) return 'single.' + domain;
     return require('os').hostname();
   }
 
@@ -1188,7 +1202,28 @@ class Platform {
   }
 }
 
-const SECRET_OBSERVABILITY_KEYS = new Set(['newrelic-license-key']);
+const SECRET_OBSERVABILITY_KEYS = new Set(['otlp-headers']);
+
+/**
+ * Parse the stored OTLP header map. A malformed or non-object value
+ * yields no headers rather than throwing: a broken credential must not
+ * stop a core from booting.
+ */
+function parseHeaders (stored: string): Record<string, string> {
+  if (!stored) return {};
+  try {
+    const parsed = JSON.parse(stored);
+    if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const key of Object.keys(parsed)) {
+      if (typeof parsed[key] === 'string') out[key] = parsed[key];
+    }
+    return out;
+  } catch {
+    logger.warn('observability: otlp-headers is not valid JSON — ignoring');
+    return {};
+  }
+}
 
 // Service URLs in this codebase carry a trailing slash by convention
 // (matches serviceInfo.{register,api,access}). Centralizing here so naive

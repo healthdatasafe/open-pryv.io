@@ -85,7 +85,8 @@ logger.debug('Loading app');
  * Application is a grab bag of singletons / system services with not many
  * methods of its own. It is the type-safe version of DI.
  */
-type APIInstance = unknown;
+/** Only the surface Application itself calls; the rest stays opaque here. */
+type APIInstance = { getMethodKeys: () => string[] };
 type Database = unknown;
 type StorageLayer = { connection: Database };
 type ExpressApp = {
@@ -121,6 +122,9 @@ class Application {
   storageLayer!: StorageLayer;
 
   expressApp!: ExpressApp;
+
+  /** Set during initiate(); reported as the telemetry service version. */
+  apiVersion!: string;
 
   isAuditActive: boolean;
 
@@ -164,11 +168,37 @@ class Application {
     this.expressApp.use(middleware.notFound);
     const errorsMiddleware = errorsMiddlewareMod(this.logging);
     this.expressApp.use(errorsMiddleware);
+    this.apiVersion = apiVersion;
     logger.debug('Init done');
     this.initalized = true;
     if (this.config.get('showRoutes')) { this.helperShowRoutes(); }
     this.initializing = false;
     return this;
+  }
+
+  /**
+   * Attach the telemetry emitter, if the operator enabled observability.
+   *
+   * ⚠ Call this only AFTER the API method modules have registered (see
+   * Server.registerApiMethods). The vocabulary handed over is the union of
+   * both API registries, and it IS the emitter's allow-list: attach it too
+   * early and every datapoint is refused as an unknown method id, which
+   * looks like working telemetry and reports nothing. Failure here is
+   * logged and ignored: telemetry never prevents a worker from serving.
+   */
+  startObservability () {
+    try {
+      const { startFromEnv } = require('business/src/observability/startup.ts');
+      const methodIds = this.api.getMethodKeys().concat(this.systemAPI.getMethodKeys());
+      const result = startFromEnv({ methodIds, serviceVersion: this.apiVersion, logger });
+      if (result.activated) {
+        logger.info('observability: telemetry emitter active (' + methodIds.length + ' methods)');
+      } else {
+        logger.debug('observability: inactive (' + result.reason + ')');
+      }
+    } catch (err) {
+      logger.warn('observability: emitter failed to start: ' + (err as Error).message);
+    }
   }
 
   /**
@@ -221,6 +251,13 @@ class Application {
     // the resolveUser + createAccess callbacks from this app's
     // MethodContext + api method registry.
     require('./routes/oauth2.ts').default(this.expressApp, this);
+
+    // Third-party sign-in (OIDC relying party). Soft-degrades to a no-op when
+    // `sso:enabled` is false (the default) or no provider is configured, so a
+    // stock deployment mounts nothing. Registered here, near the oauth2 mount,
+    // so the root-level /auth/sso/* routes bind before the per-user /:username
+    // routes are considered.
+    require('./routes/sso.ts').default(this.expressApp, this);
 
     // system, root, register and delete MUST come first
     require('./routes/auth/delete.ts').default(this.expressApp, this);

@@ -82,7 +82,7 @@ describe('[EMLS] account emails (multiple)', function () {
       assert.strictEqual(only.primary, true);
       assert.strictEqual(only.status, 'verified');
       assert.strictEqual(only.verifiedAt, null);
-      assert.strictEqual(only.verificationMethod, null);
+      assert.strictEqual(only.verificationMethod, 'registration');
     });
   });
 
@@ -202,7 +202,8 @@ describe('[EMLS] account emails (multiple)', function () {
       const oldView = res.body.account.emails.find((e) => e.value === oldPrimary);
       assert.strictEqual(newView.primary, true);
       assert.strictEqual(newView.status, 'verified');
-      assert.strictEqual(newView.verificationMethod, null);
+      assert.strictEqual(newView.verificationMethod, 'legacy');
+      assert.strictEqual(newView.verifiedAt, null, 'a legacy assertion is not a real verification');
       assert.ok(oldView, 'old primary kept as verified non-primary');
       assert.strictEqual(oldView.primary, false);
       assert.strictEqual(oldView.status, 'verified');
@@ -219,7 +220,7 @@ describe('[EMLS] account emails (multiple)', function () {
       const promoted = res.body.account.emails.find((e) => e.value === pending);
       assert.strictEqual(promoted.primary, true);
       assert.strictEqual(promoted.status, 'verified');
-      assert.strictEqual(promoted.verificationMethod, null);
+      assert.strictEqual(promoted.verificationMethod, 'legacy');
     });
 
     it('[EML53] an existing verified value is promoted', async function () {
@@ -260,7 +261,7 @@ describe('[EMLS] account emails (multiple)', function () {
         assert.strictEqual(raw[0].content.value, email);
         assert.strictEqual(raw[0].content.primary, true);
         assert.strictEqual(raw[0].content.status, 'verified');
-        assert.strictEqual(raw[0].content.verificationMethod, null);
+        assert.strictEqual(raw[0].content.verificationMethod, 'registration');
         await usersRepository.deleteOne(userId, username);
       } finally {
         if (savedIntegrity != null) process.env.DISABLE_INTEGRITY_CHECK = savedIntegrity;
@@ -331,6 +332,52 @@ describe('[EMLS] account emails (multiple)', function () {
       assert.strictEqual(named.status, 200, JSON.stringify(named.body));
       assert.ok(named.body.events.length >= 1, 'named query surfaces container events');
       assert.ok(named.body.events.every((e) => (e.streamIds || []).includes(CONTAINER)));
+    });
+
+    function streamsPath (username) { return '/' + username + '/streams'; }
+
+    it('[EML76] refuses streams.create under the container (personal token)', async function () {
+      const { u } = await seededUser();
+      const res = await coreRequest.post(streamsPath(u.username)).set('Authorization', u.token)
+        .send({ id: 'forged-child', parentId: CONTAINER, name: 'Forged' });
+      assert.ok(res.status >= 400, JSON.stringify(res.body));
+      assert.strictEqual(res.body?.error?.data?.id, 'emails-reserved-stream');
+    });
+
+    it('[EML77] refuses streams.update on the container (personal token)', async function () {
+      const { u } = await seededUser();
+      const res = await coreRequest.put(streamsPath(u.username) + '/' + encodeURIComponent(CONTAINER))
+        .set('Authorization', u.token).send({ name: 'Renamed' });
+      assert.ok(res.status >= 400, JSON.stringify(res.body));
+      assert.strictEqual(res.body?.error?.data?.id, 'emails-reserved-stream');
+    });
+
+    it('[EML78] refuses streams.delete of the container (personal token)', async function () {
+      const { u } = await seededUser();
+      const res = await coreRequest.delete(streamsPath(u.username) + '/' + encodeURIComponent(CONTAINER))
+        .set('Authorization', u.token);
+      assert.ok(res.status >= 400, JSON.stringify(res.body));
+      assert.strictEqual(res.body?.error?.data?.id, 'emails-reserved-stream');
+    });
+
+    it('[EML79] a non-personal token with star read cannot read the container by naming it', async function () {
+      const username = 'eml' + cuid().toLowerCase().slice(1, 12);
+      const personal = cuid();
+      const appToken = cuid();
+      const user = await fixtures.user(username, { email: cuid() + '@e79.example.com' });
+      await user.access({ token: personal, type: 'personal' });
+      await user.session(personal);
+      await user.access({ token: appToken, type: 'app', permissions: [{ streamId: '*', level: 'read' }] });
+      // Seed the container with a personal add.
+      await coreRequest.put('/' + username + '/account').set('Authorization', personal)
+        .send({ emails: { add: [cuid() + '@e79-extra.example.com'] } });
+      // The app token names the container explicitly — it must still get nothing
+      // (the container is account PII, blocked for non-personal tokens).
+      const named = await coreRequest.get(eventsPath(username)).set('Authorization', appToken)
+        .query({ streams: JSON.stringify([CONTAINER]) });
+      assert.strictEqual(named.status, 200, JSON.stringify(named.body));
+      assert.ok(!named.body.events.some((e) => (e.streamIds || []).includes(CONTAINER)),
+        'a non-personal token must not read the emails container even when naming it');
     });
   });
 });
