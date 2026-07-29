@@ -188,7 +188,7 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
 
   // RETRIEVAL
 
-  // Phase 4 H5: defense-in-depth — strip `:_cmc:_internal:*` ids from
+  // Defense-in-depth: strip `:_cmc:_internal:*` ids from
   // query inputs / single-event lookups / streams.get tree before they
   // reach the store. Internal CMC streams (`offer/*`, `responses/*`,
   // `retries`) have no app-visible permissions today, but the explicit
@@ -291,6 +291,7 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
     let canReadEvent = false;
     // special case no streamIds on event && deleted
     if (event.streamIds == null) { // event might be deleted - limit result to deleted property
+      context.auditRecordCount = 1; // disclosed one record's existence (breach-scope)
       result.event = { id: event.id, deleted: event.deleted };
       return next();
     }
@@ -309,6 +310,7 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
     if (!canReadEvent) { return next(errors.forbidden()); }
     // Stored attachments always carry ids; the wire type keeps them optional.
     event.attachments = setFileReadToken(context.access, event.attachments as Array<{ id: string; readToken?: string }> | undefined);
+    context.auditRecordCount = 1; // returned one record (breach-scope)
     result.event = event;
     return next();
   }
@@ -328,6 +330,12 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
           result.history!.push(e);
         }
       });
+      // Breach-scope: includeHistory discloses N prior versions alongside the
+      // head, so the read's record count is 1 + the history length, not 1.
+      if (Array.isArray(result.history) && result.history.length > 0) {
+        const head = typeof context.auditRecordCount === 'number' ? context.auditRecordCount : 1;
+        context.auditRecordCount = head + result.history.length;
+      }
       next();
     } catch (err) {
       next(errors.unexpectedError(err));
@@ -342,7 +350,7 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
   // require a personal token. Non-personal tokens hand off to
   // app-web-user-account via @pryv/cmc helpers. Reuses AccessLogic.isPersonal().
   const cmcAcceptAccessGateHook = cmc.createCmcAcceptAccessGateHook({ errors });
-  // Phase 4 H8: stamp content.from from access identity when a
+  // Forge-prevention: stamp content.from from access identity when a
   // counterparty-marked access writes a chat/system message into a
   // per-app stream. inboxWriteHook covers :_cmc:inbox; this hook covers
   // everything else. Local self-writes (personal/app token) pass
@@ -388,11 +396,11 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
     logger: getLogger('cmc:capability-mint'),
     selfIdentityFor: cmcSelfIdentityFor,
   });
-  // Phase 3.2: AFTER createEvent persists the consent/request-cmc
+  // AFTER createEvent persists the consent/request-cmc
   // trigger and the mall assigns its real id, stamp that id onto the
   // capability access's `clientData.cmc.requestEventId`. The mint hook
   // can't do this — it runs pre-persist when event.id is null.
-  // Without this post-stamp, Phase 1.1's inviteEventId-on-inbox-mirror
+  // Without this post-stamp, the inviteEventId-on-inbox-mirror
   // degrades silently on real-deploy because the source field is null.
   const cmcCapabilityPostCreateHook = cmc.createCapabilityPostCreateHook({
     mall: mallForCmc,
@@ -452,7 +460,7 @@ export default async function (api: { register (...args: unknown[]): unknown }) 
     notifyPlatformForCreate,
     handleSeries,
     createEvent,
-    // Phase 3.2 post-stamp: AFTER createEvent assigns event.id, copy it
+    // Post-stamp: AFTER createEvent assigns event.id, copy it
     // onto the capability access's clientData.cmc.requestEventId. Must
     // run after createEvent (which generates id) and before
     // cmcDispatchMiddleware (which doesn't depend on this stamp).

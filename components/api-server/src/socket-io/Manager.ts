@@ -28,6 +28,23 @@ const SUBSCRIPTION_OPS = new Set(['subscribe', 'unsubscribe', 'getSubscriptions'
 })();
 const { getAPIVersion } = require('middleware/src/project_version.ts');
 const { initRootSpan } = require('tracing');
+const { getConfig } = require('@pryv/boiler');
+
+// Socket.io calls were historically NOT audited (only the HTTP result.onEnd
+// path fires audit). That leaves a compromised access's websocket activity out
+// of the application audit trail — which the breach-scope tool depends on. Wire
+// audit here, resolved once and memoised (audit:active is boot-fixed config).
+let socketAuditPromise: Promise<{ active: boolean; audit: { validApiCall: (c: unknown, r: unknown) => Promise<void>; errorApiCall: (c: unknown, e: unknown) => Promise<void> } | null }> | null = null;
+function getSocketAudit () {
+  if (socketAuditPromise == null) {
+    socketAuditPromise = (async () => {
+      const config = await getConfig();
+      const active = config.get('audit:active') === true;
+      return { active, audit: active ? require('audit').default : null };
+    })();
+  }
+  return socketAuditPromise;
+}
 // Manages contexts for socket-io. NamespaceContext's are created when the first
 // client connects to a namespace and are then kept forever.
 //
@@ -112,6 +129,21 @@ class Manager {
      */
     async function initAsyncProps (this: Manager) {
       if (this.apiVersion == null) { this.apiVersion = await getAPIVersion(); }
+    }
+  }
+
+  // Fan the client-revoke sweep out over every open namespace.
+  //
+  // The per-namespace method below is the single implementation, and pubsub
+  // drives it directly on an access change (D10). This manager-level entry
+  // point exists for the periodic sweep in `index.ts`, which is the backstop
+  // for the case where that notification never arrives: after a broker loss,
+  // an access can be revoked with no `accessesChanged` reaching this worker,
+  // and an already-open socket authenticates once at handshake, so nothing
+  // else would ever re-check it.
+  revalidateConnections (): void {
+    for (const context of this.contexts.values()) {
+      context.revalidateConnections();
     }
   }
 }
@@ -443,10 +475,26 @@ class Connection {
     const userName = methodContext.user.username;
     // Accept streamQueries in JSON format for socket.io
     methodContext.acceptStreamsQueryNonStringified = true;
+    // The connection's methodContext is REUSED across calls — clear the
+    // breach-scope audit enrichment so a read's counts don't leak onto the next
+    // call's audit row (only a read re-sets them).
+    methodContext.auditRecordCount = undefined;
+    methodContext.auditRecordCountIncomplete = undefined;
+    methodContext.auditScopedStreamIds = undefined;
+    methodContext.auditScopedStreamCount = undefined;
     try {
       const result = await fromCallback((cb: NodeCallback) => api.call(methodContext, params, cb));
       if (result == null) { throw new Error('AF: either err or result must be non-null'); }
       const obj = await fromCallback((cb: NodeCallback) => result.toObject(cb));
+      // Audit the successful call. toObject has drained the result, so streamed
+      // reads have finished counting. Best-effort: a bad audit event must not
+      // break the socket response (mirrors the HTTP post-response semantics).
+      try {
+        const sa = await getSocketAudit();
+        if (sa.active && sa.audit != null) await sa.audit.validApiCall(methodContext, result);
+      } catch (auditErr) {
+        logger.warn('[socket.io audit] validApiCall failed for ' + apiMethod, auditErr);
+      }
       // good ending
       tracing.finishSpan('socket.io');
       // remove tracing for next call
@@ -458,6 +506,14 @@ class Connection {
         method: apiMethod,
         body: params
       }, logger);
+      // Audit the failed call too (the HTTP error middleware does this for HTTP;
+      // sockets never had it). Best-effort — must not mask the original error.
+      try {
+        const sa = await getSocketAudit();
+        if (sa.active && sa.audit != null) await sa.audit.errorApiCall(methodContext, err);
+      } catch (auditErr) {
+        logger.warn('[socket.io audit] errorApiCall failed for ' + apiMethod, auditErr);
+      }
       // bad ending
       tracing.setError('socket.io', err);
       tracing.finishSpan('socket.io');

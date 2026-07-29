@@ -1,5 +1,84 @@
 # Changelog - Internal (no API impact)
 
+## chore(supply-chain): dependency-audit gate, SBOM, image signing + provenance, hardened base image
+
+The build pipeline now detects, gates, and attests the software supply chain.
+
+**Added.**
+- `scripts/audit-prod-deps` — a CI gate that fails the build on high or critical
+  advisories affecting the shipped (`--omit=dev`) npm tree. Accepted advisories
+  live in a documented, justified allowlist rather than being silenced.
+- A CycloneDX SBOM of the source tree is emitted on every CI run and scanned
+  with Grype (build fails on critical findings); released images carry their own
+  CycloneDX SBOM.
+- On release tags, the published image is signed with keyless (OIDC) cosign and
+  carries a SLSA build-provenance attestation that pullers can verify.
+- The Docker base image is digest-pinned and the rqlite download is
+  checksum-verified before unpacking.
+
+**Changed.** nodemailer bumped to 9, clearing the standing runtime advisories.
+
+**Known bound.** The pinned `node:24-bookworm` base image still carries
+OS-level CVEs that image scanners surface; a slimmer-base migration is tracked
+separately. The claim here is detection, gating, and attestation, not a
+CVE-free image.
+
+## fix(socket-io): the periodic client-revoke sweep had never run
+
+`revalidateConnections()` is implemented on `NamespaceContext`, but the
+30-second timer in `socket-io/index.ts` calls it on the `Manager`. The call was
+`undefined`, so every tick threw `manager.revalidateConnections is not a
+function`. The throw was caught and logged at `warn`, which is why it went
+unnoticed on deployed cores while emitting two warnings a minute per worker.
+
+A socket authenticates once at handshake and never re-authenticates, so two
+things can drop a revoked connection: the pubsub notification on an access
+change, which works, and this timer, which is the backstop for when that
+notification never arrives. Since a broker loss is exactly the case where it
+does not arrive (see the pubsub-reconnect fix in the same series), the belt was
+working and the braces had never been fastened.
+
+`Manager` now implements `revalidateConnections()` as a fan-out over its open
+namespace contexts, which is what the call site already assumed. `[SNRS1-3]`
+pin the manager-level shape, the fan-out, and the empty case; without the fix
+they reproduce the production `TypeError` exactly.
+
+## feat(breach-scope): operator tooling to scope a breach from a compromised accessId
+
+An incident responder who holds only a compromised `accessId` and a time window
+can now produce the technical inputs for a breach notification (subjects
+affected, records affected, categories of data by stream scope) without an O(N)
+walk over every user or a fragile re-run of the historical query.
+
+**Added.**
+- A cluster-wide access reverse-index over the platform key/value store
+  (`components/platform/src/accessIndex.ts`) mapping a bare `accessId` to its
+  owning user plus minimal operational metadata (type, expires, created /
+  last-modified, deleted). PII posture follows the existing hashing regime: in
+  hashed mode the row carries the username HMAC token, never plaintext, and the
+  secret access token is never stored. Subject erasure removes or tombstones the
+  row. Populated by hooks at every access-creation site plus update / delete
+  cascade; a `bin/backfill-access-index.js` script backfills and repairs.
+- An admin-key-gated `GET /system/accesses/:accessId` that normalises composite
+  `<base>:<serial>` ids and always returns revoked accesses (scoping a breach
+  after revocation is the primary case).
+- Read audit rows now carry `content.recordCount` (records the read delivered;
+  `0` on empty reads, `1` for a single-event read, absent on writes and
+  pre-change rows) and `content.scopedStreamIds` + `content.scopedStreamCount`
+  (the streams the read was scoped to; a bare wildcard collapses to `['*']`, the
+  id list caps at 100 while the count preserves the true total). A partial count
+  from an aborted drain is labeled `recordCountIncomplete`. The fields ride in
+  the audit `content` blob, so no schema migration.
+- `bin/breach-scope.js`: a read-only, credential-free operator CLI run on the
+  subject's home core. It resolves the owner, recovers the plaintext username
+  locally in hashed mode, pulls the access's audit rows for the window, and
+  renders a caveat-labeled report as JSON and/or Markdown, plus a
+  `breachScopeReport` module that does the classification and rendering.
+
+**Fixed.** Socket.io API calls produced no audit row at all; they are now
+audited like HTTP calls (best-effort, never breaking the socket response). Batch
+calls drain the result before auditing so streamed reads finish counting.
+
 ## refactor(observability): replace the vendor agent with an allow-list emitter
 
 The optional APM integration is rebuilt around a single choke point instead of

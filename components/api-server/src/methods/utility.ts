@@ -88,6 +88,18 @@ export default async function (api: { register: (...args: unknown[]) => void; ca
     for (const call of calls) {
       result.results.push(await executeCall(call));
     }
+    // The OUTER callBatch result is written to HTTP, so its onEnd (API.ts) fires
+    // `validApiCall` once more for the batch envelope. After the loop `context`
+    // still holds the LAST inner call's methodId + breach-scope enrichment (reset
+    // happens BEFORE each call, not after the loop) — without this the envelope
+    // row would duplicate that call's action AND its recordCount/scope, so a
+    // batched read's records get counted twice in the breach report. Restore the
+    // envelope's own identity and clear the per-read enrichment.
+    context.methodId = 'callBatch';
+    context.auditRecordCount = undefined;
+    context.auditRecordCountIncomplete = undefined;
+    context.auditScopedStreamIds = undefined;
+    context.auditScopedStreamCount = undefined;
     context.disableAccessUsageStats = false; // to allow tracking functions
     next();
     async function executeCall (call: ApiCall) {
@@ -95,10 +107,20 @@ export default async function (api: { register: (...args: unknown[]) => void; ca
         countCall(call.method);
         // update methodId to match the call todo
         context.methodId = call.method;
+        // The context is REUSED across batched calls — clear the breach-scope
+        // audit enrichment so a read's counts never leak onto the next call's
+        // audit row (only a read re-sets them).
+        context.auditRecordCount = undefined;
+        context.auditRecordCountIncomplete = undefined;
+        context.auditScopedStreamIds = undefined;
+        context.auditScopedStreamCount = undefined;
         // Perform API call
         const result = await fromCallback((cb: (err: unknown, res: unknown) => void) => api.call(context, call.params, cb)) as { toObject: (cb: (err: unknown, res: unknown) => void) => void };
+        // Drain the result FIRST so streamed reads finish counting, THEN audit —
+        // otherwise a batched events.get audits a false recordCount: 0.
+        const obj = await fromCallback((cb: (err: unknown, res: unknown) => void) => result.toObject(cb));
         if (isAuditActive && audit) { await audit.validApiCall(context, result); }
-        return await fromCallback((cb: (err: unknown, res: unknown) => void) => result.toObject(cb));
+        return obj;
       } catch (err) {
         // Batchcalls have specific error handling hence the custom request context
         const reqContext = {
